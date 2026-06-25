@@ -18,11 +18,11 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pgadri/my-captures")
 
 
-def get_openai_client():
-    api_key = os.environ.get("OPENAI_API_KEY")
+def get_groq_client():
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable is not set")
-    return openai.OpenAI(api_key=api_key)
+        raise ValueError("GROQ_API_KEY environment variable is not set")
+    return openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
 
 class CaptureRequest(BaseModel):
@@ -70,14 +70,14 @@ def download_audio(url: str, output_dir: str) -> tuple[str, str]:
 
 def transcribe(audio_path: str) -> str:
     with open(audio_path, "rb") as f:
-        result = get_openai_client().audio.transcriptions.create(model="whisper-1", file=f)
+        result = get_groq_client().audio.transcriptions.create(model="whisper-large-v3-turbo", file=f)
     return result.text
 
 
 def summarize(transcript: str, raw_title: str) -> dict:
     """Returns { title: str, bullets: list[str] } extracted by GPT."""
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response = get_groq_client().chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "system",
@@ -221,8 +221,8 @@ This map contains {req.capture_count} knowledge captures with expert insights, a
 
 @app.post("/analyze-image")
 async def analyze_image(req: AnalyzeImageRequest):
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o",
+    response = get_groq_client().chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{
             "role": "user",
             "content": [
@@ -232,7 +232,7 @@ async def analyze_image(req: AnalyzeImageRequest):
                         "You are a knowledge extraction assistant for app builders and vibe coders. "
                         "Extract from this screenshot: (1) a specific title under 12 words describing what this is about, "
                         "(2) 3-5 actionable bullet insights — concrete and specific, not vague summaries. "
-                        "Respond with JSON only: {\"title\": \"...\", \"bullets\": [\"...\", ...]}"
+                        "Respond with JSON only, no markdown: {\"title\": \"...\", \"bullets\": [\"...\", ...]}"
                     ),
                 },
                 {
@@ -242,10 +242,14 @@ async def analyze_image(req: AnalyzeImageRequest):
             ],
         }],
         max_tokens=400,
-        response_format={"type": "json_object"},
     )
     try:
-        data = json.loads(response.choices[0].message.content)
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw.strip())
+        data = json.loads(raw)
         bullets = [str(b) for b in data.get("bullets", [])][:5]
         preview = "\n".join(f"• {b}" for b in bullets)
         return {
@@ -444,8 +448,8 @@ async def chat(req: ChatRequest):
         for i, c in enumerate(req.captures[:8])
     ])
 
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response = get_groq_client().chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "system",
