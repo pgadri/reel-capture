@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+openai
+yt-dlp
+requests
+python-multipart
