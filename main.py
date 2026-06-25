@@ -46,6 +46,10 @@ class ScanRepoRequest(BaseModel):
     repo_url: str
 
 
+class AnalyzeImageRequest(BaseModel):
+    image_base64: str
+
+
 def download_audio(url: str, output_dir: str) -> tuple[str, str]:
     ydl_opts = {
         "format": "bestaudio/best",
@@ -179,6 +183,7 @@ async def capture(req: CaptureRequest):
             "note_url": note_url,
             "preview": preview,
             "bullets": bullets,
+            "creator": uploader,
         }
 
 
@@ -212,6 +217,44 @@ This map contains {req.capture_count} knowledge captures with expert insights, a
         raise HTTPException(status_code=500, detail=f"GitHub push failed: {str(e)}")
 
     return {"success": True, "url": note_url}
+
+
+@app.post("/analyze-image")
+async def analyze_image(req: AnalyzeImageRequest):
+    response = get_openai_client().chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "You are a knowledge extraction assistant for app builders and vibe coders. "
+                        "Extract from this screenshot: (1) a specific title under 12 words describing what this is about, "
+                        "(2) 3-5 actionable bullet insights — concrete and specific, not vague summaries. "
+                        "Respond with JSON only: {\"title\": \"...\", \"bullets\": [\"...\", ...]}"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{req.image_base64}"},
+                },
+            ],
+        }],
+        max_tokens=400,
+        response_format={"type": "json_object"},
+    )
+    try:
+        data = json.loads(response.choices[0].message.content)
+        bullets = [str(b) for b in data.get("bullets", [])][:5]
+        preview = "\n".join(f"• {b}" for b in bullets)
+        return {
+            "title": data.get("title", "Screenshot capture"),
+            "preview": preview,
+            "bullets": bullets,
+        }
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to analyze image")
 
 
 def _parse_owner_repo(repo_url: str) -> tuple[str, str]:
