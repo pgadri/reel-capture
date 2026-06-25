@@ -88,7 +88,7 @@ def summarize(transcript: str, raw_title: str) -> dict:
                     "- 'title': a specific, concrete title under 12 words — captures the real topic, not generic\n"
                     "- 'category': one word from this list that best describes the content: technical, marketing, launch, pricing, founder, product\n"
                     "- 'concepts': array of 4-6 key insights or facts from the content — real specifics, not summaries, complete sentences up to 200 chars\n"
-                    "- 'actions': array of 3-5 concrete things the viewer should do based on this — start with a verb, specific and actionable\n"
+                    "- 'actions': array of 3-5 concrete actions. For TECHNICAL content: specific commands to run, exact packages to install, or precise code changes to make (e.g. 'Run npm audit and fix all high-severity CVEs', 'Add helmet.js to set security headers', 'Validate all user inputs with zod before processing'). For non-technical: concrete next steps starting with a verb.\n"
                     "- 'quotes': array of 1-3 memorable direct quotes or sharp paraphrases from the speaker — the lines worth remembering\n"
                     "No bullet symbols. Extract genuine substance — the specific numbers, decisions, and lessons, not vague advice.\n"
                     "Use 'technical' only if the content is primarily about writing code, building systems, or engineering implementation. "
