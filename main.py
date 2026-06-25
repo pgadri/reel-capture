@@ -9,10 +9,17 @@ from datetime import datetime
 import yt_dlp
 import openai
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
+limiter = Limiter(key_func=get_remote_address, default_limits=["200/hour"])
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pgadri/my-captures")
@@ -61,17 +68,36 @@ def download_audio(url: str, output_dir: str) -> tuple[str, str]:
         }],
         "quiet": True,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = info.get("title", "Untitled")
-        uploader = info.get("uploader", "Unknown")
-        return title, uploader
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title", "Untitled")
+            uploader = info.get("uploader", "Unknown")
+            return title, uploader
+    except yt_dlp.utils.ExtractorError as e:
+        msg = str(e).lower()
+        if "login" in msg or "private" in msg or "age" in msg:
+            raise Exception("This video is private or requires login. Try a public video.")
+        if "copyright" in msg or "removed" in msg or "unavailable" in msg:
+            raise Exception("This video is unavailable or has been removed.")
+        raise Exception(f"Could not download video. The platform may have blocked this request.")
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e).lower()
+        if "instagram" in msg or "tiktok" in msg:
+            raise Exception("Instagram and TikTok sometimes block downloads. Try again in a moment, or try a different video.")
+        raise Exception("Download failed. Check the URL is correct and the video is public.")
 
 
 def transcribe(audio_path: str) -> str:
-    with open(audio_path, "rb") as f:
-        result = get_groq_client().audio.transcriptions.create(model="whisper-large-v3-turbo", file=f)
-    return result.text
+    try:
+        with open(audio_path, "rb") as f:
+            result = get_groq_client().audio.transcriptions.create(model="whisper-large-v3-turbo", file=f)
+        return result.text
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg or "quota" in msg or "rate_limit" in msg.lower():
+            raise Exception("AI service is temporarily over capacity. Please try again in a minute.")
+        raise
 
 
 def summarize(transcript: str, raw_title: str) -> dict:
@@ -148,7 +174,8 @@ def health():
 
 
 @app.post("/capture")
-async def capture(req: CaptureRequest):
+@limiter.limit("10/minute")
+async def capture(request: Request, req: CaptureRequest):
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             title, uploader = download_audio(req.url, tmpdir)
@@ -245,7 +272,8 @@ This map contains {req.capture_count} knowledge captures with expert insights, a
 
 
 @app.post("/analyze-image")
-async def analyze_image(req: AnalyzeImageRequest):
+@limiter.limit("10/minute")
+async def analyze_image(request: Request, req: AnalyzeImageRequest):
     response = get_groq_client().chat.completions.create(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{
@@ -464,7 +492,8 @@ async def scan_repo(req: ScanRepoRequest):
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+@limiter.limit("30/minute")
+async def chat(request: Request, req: ChatRequest):
     if not req.captures:
         return {"answer": "No captures in your Grimoire yet. Add some captures first!", "sources": []}
 
