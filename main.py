@@ -86,10 +86,13 @@ def summarize(transcript: str, raw_title: str) -> dict:
                     "Given a video transcript, extract the full value of the content. "
                     "Respond with a JSON object with exactly four keys:\n"
                     "- 'title': a specific, concrete title under 12 words — captures the real topic, not generic\n"
+                    "- 'category': one word from this list that best describes the content: technical, marketing, launch, pricing, founder, product\n"
                     "- 'concepts': array of 4-6 key insights or facts from the content — real specifics, not summaries, complete sentences up to 200 chars\n"
                     "- 'actions': array of 3-5 concrete things the viewer should do based on this — start with a verb, specific and actionable\n"
                     "- 'quotes': array of 1-3 memorable direct quotes or sharp paraphrases from the speaker — the lines worth remembering\n"
-                    "No bullet symbols. Extract genuine substance — the specific numbers, decisions, and lessons, not vague advice."
+                    "No bullet symbols. Extract genuine substance — the specific numbers, decisions, and lessons, not vague advice.\n"
+                    "Use 'technical' only if the content is primarily about writing code, building systems, or engineering implementation. "
+                    "Business, growth, strategy, and founder topics are NOT technical."
                 ),
             },
             {
@@ -105,9 +108,14 @@ def summarize(transcript: str, raw_title: str) -> dict:
         concepts = [str(b) for b in data.get("concepts", [])][:6]
         actions = [str(b) for b in data.get("actions", [])][:5]
         quotes = [str(b) for b in data.get("quotes", [])][:3]
+        valid_categories = {"technical", "marketing", "launch", "pricing", "founder", "product"}
+        category = data.get("category", "founder").lower()
+        if category not in valid_categories:
+            category = "founder"
         preview = "\n".join(f"• {b}" for b in concepts)
         return {
             "title": data.get("title") or raw_title,
+            "category": category,
             "concepts": concepts,
             "actions": actions,
             "quotes": quotes,
@@ -115,7 +123,7 @@ def summarize(transcript: str, raw_title: str) -> dict:
             "preview": preview,
         }
     except Exception:
-        return {"title": raw_title, "concepts": [], "actions": [], "quotes": [], "bullets": [], "preview": ""}
+        return {"title": raw_title, "category": "founder", "concepts": [], "actions": [], "quotes": [], "bullets": [], "preview": ""}
 
 
 def push_to_github(filename: str, content: str) -> str:
@@ -195,6 +203,7 @@ async def capture(req: CaptureRequest):
             "note_url": note_url or "",
             "preview": preview,
             "bullets": summary["bullets"],
+            "category": summary["category"],
             "concepts": summary["concepts"],
             "actions": summary["actions"],
             "quotes": summary["quotes"],
