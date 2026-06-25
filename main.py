@@ -13,11 +13,15 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pgadri/my-captures")
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+def get_openai_client():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    return openai.OpenAI(api_key=api_key)
 
 
 class CaptureRequest(BaseModel):
@@ -44,7 +48,7 @@ def download_audio(url: str, output_dir: str) -> tuple[str, str]:
 
 def transcribe(audio_path: str) -> str:
     with open(audio_path, "rb") as f:
-        result = client.audio.transcriptions.create(model="whisper-1", file=f)
+        result = get_openai_client().audio.transcriptions.create(model="whisper-1", file=f)
     return result.text
 
 
