@@ -75,7 +75,7 @@ def transcribe(audio_path: str) -> str:
 
 
 def summarize(transcript: str, raw_title: str) -> dict:
-    """Returns { title: str, bullets: list[str] } extracted by GPT."""
+    """Returns { title, concepts, actions, quotes, bullets, preview }."""
     response = get_groq_client().chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
@@ -83,28 +83,39 @@ def summarize(transcript: str, raw_title: str) -> dict:
                 "role": "system",
                 "content": (
                     "You are a knowledge extraction assistant for app builders and vibe coders. "
-                    "Given a video transcript, respond with a JSON object containing exactly two keys: "
-                    "'title' (a specific, concrete title under 12 words — not generic) and "
-                    "'bullets' (an array of 3 to 5 actionable insights, each under 100 characters, "
-                    "no bullet symbols, concrete and specific not vague)."
+                    "Given a video transcript, extract the full value of the content. "
+                    "Respond with a JSON object with exactly four keys:\n"
+                    "- 'title': a specific, concrete title under 12 words — captures the real topic, not generic\n"
+                    "- 'concepts': array of 4-6 key insights or facts from the content — real specifics, not summaries, complete sentences up to 200 chars\n"
+                    "- 'actions': array of 3-5 concrete things the viewer should do based on this — start with a verb, specific and actionable\n"
+                    "- 'quotes': array of 1-3 memorable direct quotes or sharp paraphrases from the speaker — the lines worth remembering\n"
+                    "No bullet symbols. Extract genuine substance — the specific numbers, decisions, and lessons, not vague advice."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Raw title from video: {raw_title}\n\nTranscript:\n{transcript[:4000]}",
+                "content": f"Raw title from video: {raw_title}\n\nTranscript:\n{transcript[:8000]}",
             },
         ],
-        max_tokens=400,
+        max_tokens=900,
         response_format={"type": "json_object"},
     )
     try:
         data = json.loads(response.choices[0].message.content)
+        concepts = [str(b) for b in data.get("concepts", [])][:6]
+        actions = [str(b) for b in data.get("actions", [])][:5]
+        quotes = [str(b) for b in data.get("quotes", [])][:3]
+        preview = "\n".join(f"• {b}" for b in concepts)
         return {
             "title": data.get("title") or raw_title,
-            "bullets": [str(b) for b in data.get("bullets", [])][:5],
+            "concepts": concepts,
+            "actions": actions,
+            "quotes": quotes,
+            "bullets": concepts,  # backward compat
+            "preview": preview,
         }
     except Exception:
-        return {"title": raw_title, "bullets": []}
+        return {"title": raw_title, "concepts": [], "actions": [], "quotes": [], "bullets": [], "preview": ""}
 
 
 def push_to_github(filename: str, content: str) -> str:
@@ -183,7 +194,11 @@ async def capture(req: CaptureRequest):
             "title": clean_title,
             "note_url": note_url or "",
             "preview": preview,
-            "bullets": bullets,
+            "bullets": summary["bullets"],
+            "concepts": summary["concepts"],
+            "actions": summary["actions"],
+            "quotes": summary["quotes"],
+            "transcript": transcript,
             "creator": uploader,
         }
 
