@@ -172,15 +172,16 @@ async def capture(req: CaptureRequest):
 {transcript}
 """
 
+        note_url = None
         try:
             note_url = push_to_github(filename, note)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"GitHub push failed: {str(e)}")
+        except Exception:
+            pass  # GitHub push is optional — capture still succeeds without it
 
         return {
             "success": True,
             "title": clean_title,
-            "note_url": note_url,
+            "note_url": note_url or "",
             "preview": preview,
             "bullets": bullets,
             "creator": uploader,
