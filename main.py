@@ -203,6 +203,57 @@ class PasteTranscriptRequest(BaseModel):
     platform: str | None = None
 
 
+class ReputationSyncRequest(BaseModel):
+    points: int
+
+
+class CreatorApplicationRequest(BaseModel):
+    motivation: str
+    sample_content: str
+
+
+class CreatePacketRequest(BaseModel):
+    title: str
+    description: str = ''
+    category: str = 'founder'
+    cover_emoji: str = '📦'
+
+
+class UpdatePacketRequest(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    category: str | None = None
+    cover_emoji: str | None = None
+
+
+class CreateChapterRequest(BaseModel):
+    title: str
+    content: str
+    chapter_order: int = 0
+    is_preview: bool = False
+
+
+class UpdateChapterRequest(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    chapter_order: int | None = None
+    is_preview: bool | None = None
+
+
+class AdminReviewRequest(BaseModel):
+    action: str  # "approve" or "reject"
+    reason: str | None = None
+
+
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+
+
+def require_admin(request: Request):
+    secret = request.headers.get("X-Admin-Secret", "")
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
 def extract_youtube_id(url: str) -> str | None:
     m = re.search(r'(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})', url)
     return m.group(1) if m else None
@@ -991,6 +1042,48 @@ async def run_migrations():
         );
         CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_replies_thread ON thread_replies(thread_id, created_at);
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation_points INTEGER DEFAULT 0;
+        CREATE TABLE IF NOT EXISTS creator_applications (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            status TEXT DEFAULT 'pending',
+            motivation TEXT NOT NULL,
+            sample_content TEXT NOT NULL,
+            rejection_reason TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            reviewed_at TIMESTAMP,
+            UNIQUE(user_id)
+        );
+        CREATE TABLE IF NOT EXISTS packets (
+            id SERIAL PRIMARY KEY,
+            author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            category TEXT DEFAULT 'founder',
+            cover_emoji TEXT DEFAULT '📦',
+            status TEXT DEFAULT 'draft',
+            rejection_reason TEXT,
+            total_reads INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS packet_chapters (
+            id SERIAL PRIMARY KEY,
+            packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            chapter_order INTEGER DEFAULT 0,
+            is_preview BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS packet_reads (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
+            read_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY(user_id, packet_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_packets_status ON packets(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_chapters_packet ON packet_chapters(packet_id, chapter_order);
     """)
 
 
@@ -1521,3 +1614,405 @@ async def vote_reply(thread_id: int, reply_id: int, uid: str = Depends(current_u
         await pool.execute("UPDATE thread_replies SET upvotes=upvotes+1 WHERE id=$1", reply_id)
         new_votes = await pool.fetchval("SELECT upvotes FROM thread_replies WHERE id=$1", reply_id)
         return {"myVote": True, "upvotes": new_votes}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPUTATION SYNC
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.put("/auth/reputation")
+async def sync_reputation(req: ReputationSyncRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    await pool.execute("UPDATE users SET reputation_points=$1 WHERE id=$2", req.points, int(uid))
+    return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CREATOR APPLICATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/creator/apply")
+async def creator_apply(req: CreatorApplicationRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    user = await pool.fetchrow("SELECT reputation_points, creator_mode FROM users WHERE id=$1", int(uid))
+    if user["creator_mode"]:
+        raise HTTPException(status_code=400, detail="Already a creator")
+
+    # Auto-approve if user has Expert level (500+ Gears)
+    auto_approve = (user["reputation_points"] or 0) >= 500
+    status = "approved" if auto_approve else "pending"
+    reviewed_at = "NOW()" if auto_approve else "NULL"
+
+    existing = await pool.fetchrow("SELECT id, status FROM creator_applications WHERE user_id=$1", int(uid))
+    if existing:
+        if existing["status"] == "approved":
+            raise HTTPException(status_code=400, detail="Application already approved")
+        await pool.execute(
+            "UPDATE creator_applications SET status=$1, motivation=$2, sample_content=$3, reviewed_at=CASE WHEN $1='approved' THEN NOW() ELSE NULL END WHERE user_id=$4",
+            status, req.motivation, req.sample_content, int(uid),
+        )
+    else:
+        await pool.execute(
+            "INSERT INTO creator_applications(user_id, status, motivation, sample_content, reviewed_at) VALUES($1,$2,$3,$4,CASE WHEN $2='approved' THEN NOW() ELSE NULL END)",
+            int(uid), status, req.motivation, req.sample_content,
+        )
+
+    if auto_approve:
+        await pool.execute("UPDATE users SET creator_mode=TRUE, creator_enabled_at=NOW() WHERE id=$1", int(uid))
+
+    return {"status": status, "autoApproved": auto_approve}
+
+
+@app.get("/creator/application")
+async def get_creator_application(uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT id, status, rejection_reason, created_at, reviewed_at FROM creator_applications WHERE user_id=$1",
+        int(uid),
+    )
+    if not row:
+        return {"status": "none"}
+    return {
+        "id": str(row["id"]),
+        "status": row["status"],
+        "rejectionReason": row["rejection_reason"],
+        "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
+        "reviewedAt": row["reviewed_at"].isoformat() if row["reviewed_at"] else None,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PACKET HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _chapter_row(ch) -> dict:
+    return {
+        "id": str(ch["id"]),
+        "packetId": str(ch["packet_id"]),
+        "title": ch["title"],
+        "content": ch["content"],
+        "chapterOrder": ch["chapter_order"],
+        "isPreview": ch["is_preview"],
+    }
+
+
+def _packet_row(p, chapters=None, is_subscriber=False) -> dict:
+    out = {
+        "id": str(p["id"]),
+        "authorId": str(p["author_id"]),
+        "authorName": p.get("author_name") or "Creator",
+        "authorHandle": p.get("author_handle"),
+        "title": p["title"],
+        "description": p["description"],
+        "category": p["category"],
+        "coverEmoji": p["cover_emoji"],
+        "status": p["status"],
+        "totalReads": p["total_reads"],
+        "chapterCount": p.get("chapter_count", 0),
+        "createdAt": p["created_at"].isoformat() if p.get("created_at") else None,
+        "updatedAt": p["updated_at"].isoformat() if p.get("updated_at") else None,
+    }
+    if chapters is not None:
+        visible = [_chapter_row(c) for c in chapters if c["is_preview"] or is_subscriber]
+        out["chapters"] = visible
+        out["previewChapterCount"] = sum(1 for c in chapters if c["is_preview"])
+    return out
+
+
+async def _require_creator(uid: str, pool) -> None:
+    user = await pool.fetchrow("SELECT creator_mode FROM users WHERE id=$1", int(uid))
+    if not user or not user["creator_mode"]:
+        raise HTTPException(status_code=403, detail="Creator access required. Apply at /creator/apply")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PACKET ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/packets")
+async def list_packets(
+    category: str | None = None,
+    offset: int = 0,
+    limit: int = 20,
+    uid: str | None = Depends(lambda creds=Depends(bearer_scheme): decode_token(creds.credentials) if creds else None),
+):
+    pool = await get_pool()
+    params: list = ["published"]
+    sql = """
+        SELECT p.*, u.name AS author_name, u.handle AS author_handle,
+               (SELECT COUNT(*) FROM packet_chapters WHERE packet_id=p.id) AS chapter_count
+        FROM packets p JOIN users u ON u.id=p.author_id
+        WHERE p.status=$1
+    """
+    if category:
+        params.append(category)
+        sql += f" AND p.category=${len(params)}"
+    params += [limit, offset]
+    sql += f" ORDER BY p.total_reads DESC, p.created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
+    rows = await pool.fetch(sql, *params)
+    return [_packet_row(r) for r in rows]
+
+
+@app.get("/my/packets")
+async def my_packets(uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    await _require_creator(uid, pool)
+    rows = await pool.fetch(
+        """SELECT p.*,
+               (SELECT COUNT(*) FROM packet_chapters WHERE packet_id=p.id) AS chapter_count
+           FROM packets p WHERE p.author_id=$1 ORDER BY p.created_at DESC""",
+        int(uid),
+    )
+    return [_packet_row(r) for r in rows]
+
+
+@app.post("/packets")
+async def create_packet(req: CreatePacketRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    await _require_creator(uid, pool)
+    row = await pool.fetchrow(
+        "INSERT INTO packets(author_id,title,description,category,cover_emoji) VALUES($1,$2,$3,$4,$5) RETURNING *",
+        int(uid), req.title.strip(), req.description.strip(), req.category, req.cover_emoji,
+    )
+    return _packet_row(row)
+
+
+@app.get("/packets/{packet_id}")
+async def get_packet(
+    packet_id: int,
+    uid: str | None = Depends(lambda creds=Depends(bearer_scheme): decode_token(creds.credentials) if creds else None),
+):
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT p.*, u.name AS author_name, u.handle AS author_handle FROM packets p JOIN users u ON u.id=p.author_id WHERE p.id=$1",
+        packet_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+
+    is_author = uid and str(row["author_id"]) == uid
+    if row["status"] != "published" and not is_author:
+        raise HTTPException(status_code=404, detail="Packet not found")
+
+    chapters = await pool.fetch(
+        "SELECT * FROM packet_chapters WHERE packet_id=$1 ORDER BY chapter_order, id",
+        packet_id,
+    )
+    # Subscribers and authors see all chapters; others see preview only
+    is_subscriber = bool(uid)  # For now, any authenticated user can read — paywall added later
+    return _packet_row(row, chapters=chapters, is_subscriber=is_subscriber or is_author)
+
+
+@app.put("/packets/{packet_id}")
+async def update_packet(packet_id: int, req: UpdatePacketRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id, status FROM packets WHERE id=$1", packet_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your packet")
+    if row["status"] not in ("draft", "rejected"):
+        raise HTTPException(status_code=400, detail="Can only edit draft or rejected packets")
+    updates, params = [], [packet_id]
+    if req.title is not None:
+        params.append(req.title.strip()); updates.append(f"title=${len(params)}")
+    if req.description is not None:
+        params.append(req.description.strip()); updates.append(f"description=${len(params)}")
+    if req.category is not None:
+        params.append(req.category); updates.append(f"category=${len(params)}")
+    if req.cover_emoji is not None:
+        params.append(req.cover_emoji); updates.append(f"cover_emoji=${len(params)}")
+    if updates:
+        params.append(datetime.now(timezone.utc))
+        await pool.execute(
+            f"UPDATE packets SET {', '.join(updates)}, updated_at=${len(params)} WHERE id=$1",
+            *params,
+        )
+    return {"ok": True}
+
+
+@app.delete("/packets/{packet_id}")
+async def delete_packet(packet_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id FROM packets WHERE id=$1", packet_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your packet")
+    await pool.execute("DELETE FROM packets WHERE id=$1", packet_id)
+    return {"ok": True}
+
+
+@app.post("/packets/{packet_id}/submit")
+async def submit_packet(packet_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id, status FROM packets WHERE id=$1", packet_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your packet")
+    if row["status"] not in ("draft", "rejected"):
+        raise HTTPException(status_code=400, detail="Only draft or rejected packets can be submitted")
+    chapter_count = await pool.fetchval("SELECT COUNT(*) FROM packet_chapters WHERE packet_id=$1", packet_id)
+    if chapter_count == 0:
+        raise HTTPException(status_code=400, detail="Add at least one chapter before submitting")
+    await pool.execute(
+        "UPDATE packets SET status='pending_review', updated_at=NOW() WHERE id=$1", packet_id,
+    )
+    return {"ok": True, "status": "pending_review"}
+
+
+@app.post("/packets/{packet_id}/read")
+async def record_read(packet_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT status FROM packets WHERE id=$1", packet_id)
+    if not row or row["status"] != "published":
+        raise HTTPException(status_code=404, detail="Packet not found")
+    existing = await pool.fetchrow(
+        "SELECT 1 FROM packet_reads WHERE user_id=$1 AND packet_id=$2", int(uid), packet_id,
+    )
+    if not existing:
+        await pool.execute(
+            "INSERT INTO packet_reads(user_id,packet_id) VALUES($1,$2)", int(uid), packet_id,
+        )
+        await pool.execute("UPDATE packets SET total_reads=total_reads+1 WHERE id=$1", packet_id)
+    return {"ok": True}
+
+
+# ─── Chapters ────────────────────────────────────────────────────────────────
+
+@app.post("/packets/{packet_id}/chapters")
+async def add_chapter(packet_id: int, req: CreateChapterRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id, status FROM packets WHERE id=$1", packet_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your packet")
+    if row["status"] not in ("draft", "rejected"):
+        raise HTTPException(status_code=400, detail="Can only edit draft or rejected packets")
+    ch = await pool.fetchrow(
+        "INSERT INTO packet_chapters(packet_id,title,content,chapter_order,is_preview) VALUES($1,$2,$3,$4,$5) RETURNING *",
+        packet_id, req.title.strip(), req.content.strip(), req.chapter_order, req.is_preview,
+    )
+    return _chapter_row(ch)
+
+
+@app.put("/packets/{packet_id}/chapters/{chapter_id}")
+async def update_chapter(packet_id: int, chapter_id: int, req: UpdateChapterRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    p = await pool.fetchrow("SELECT author_id FROM packets WHERE id=$1", packet_id)
+    if not p or str(p["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your packet")
+    updates, params = [], [chapter_id, packet_id]
+    if req.title is not None:
+        params.append(req.title.strip()); updates.append(f"title=${len(params)}")
+    if req.content is not None:
+        params.append(req.content.strip()); updates.append(f"content=${len(params)}")
+    if req.chapter_order is not None:
+        params.append(req.chapter_order); updates.append(f"chapter_order=${len(params)}")
+    if req.is_preview is not None:
+        params.append(req.is_preview); updates.append(f"is_preview=${len(params)}")
+    if updates:
+        await pool.execute(
+            f"UPDATE packet_chapters SET {', '.join(updates)} WHERE id=$1 AND packet_id=$2",
+            *params,
+        )
+    return {"ok": True}
+
+
+@app.delete("/packets/{packet_id}/chapters/{chapter_id}")
+async def delete_chapter(packet_id: int, chapter_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    p = await pool.fetchrow("SELECT author_id FROM packets WHERE id=$1", packet_id)
+    if not p or str(p["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your packet")
+    await pool.execute("DELETE FROM packet_chapters WHERE id=$1 AND packet_id=$2", chapter_id, packet_id)
+    return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADMIN ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/applications/{app_id}/review")
+async def admin_review_application(app_id: int, req: AdminReviewRequest, request: Request):
+    require_admin(request)
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT user_id FROM creator_applications WHERE id=$1", app_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if req.action == "approve":
+        await pool.execute(
+            "UPDATE creator_applications SET status='approved', reviewed_at=NOW() WHERE id=$1", app_id,
+        )
+        await pool.execute(
+            "UPDATE users SET creator_mode=TRUE, creator_enabled_at=NOW() WHERE id=$1", row["user_id"],
+        )
+    elif req.action == "reject":
+        await pool.execute(
+            "UPDATE creator_applications SET status='rejected', rejection_reason=$1, reviewed_at=NOW() WHERE id=$2",
+            req.reason, app_id,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    return {"ok": True}
+
+
+@app.post("/admin/packets/{packet_id}/review")
+async def admin_review_packet(packet_id: int, req: AdminReviewRequest, request: Request):
+    require_admin(request)
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT id FROM packets WHERE id=$1", packet_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Packet not found")
+    if req.action == "approve":
+        await pool.execute(
+            "UPDATE packets SET status='published', updated_at=NOW() WHERE id=$1", packet_id,
+        )
+    elif req.action == "reject":
+        await pool.execute(
+            "UPDATE packets SET status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2",
+            req.reason, packet_id,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    return {"ok": True}
+
+
+@app.get("/admin/applications")
+async def admin_list_applications(request: Request, status: str = "pending"):
+    require_admin(request)
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """SELECT a.*, u.name AS user_name, u.email AS user_email, u.reputation_points
+           FROM creator_applications a JOIN users u ON u.id=a.user_id
+           WHERE a.status=$1 ORDER BY a.created_at""",
+        status,
+    )
+    return [{
+        "id": str(r["id"]),
+        "userId": str(r["user_id"]),
+        "userName": r["user_name"],
+        "userEmail": r["user_email"],
+        "reputationPoints": r["reputation_points"],
+        "status": r["status"],
+        "motivation": r["motivation"],
+        "sampleContent": r["sample_content"],
+        "rejectionReason": r["rejection_reason"],
+        "createdAt": r["created_at"].isoformat() if r["created_at"] else None,
+    } for r in rows]
+
+
+@app.get("/admin/packets")
+async def admin_list_packets(request: Request, status: str = "pending_review"):
+    require_admin(request)
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """SELECT p.*, u.name AS author_name, u.email AS author_email,
+               (SELECT COUNT(*) FROM packet_chapters WHERE packet_id=p.id) AS chapter_count
+           FROM packets p JOIN users u ON u.id=p.author_id
+           WHERE p.status=$1 ORDER BY p.created_at""",
+        status,
+    )
+    return [_packet_row(r) for r in rows]
