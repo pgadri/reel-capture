@@ -196,6 +196,39 @@ class AnalyzeImageRequest(BaseModel):
     image_base64: str
 
 
+class PasteTranscriptRequest(BaseModel):
+    text: str
+    title: str = "Untitled"
+    source_url: str | None = None
+    platform: str | None = None
+
+
+def extract_youtube_id(url: str) -> str | None:
+    m = re.search(r'(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})', url)
+    return m.group(1) if m else None
+
+
+def get_youtube_transcript(url: str) -> tuple[str, str, str] | None:
+    """Try to get YouTube transcript without downloading audio. Returns (title, uploader, transcript) or None."""
+    vid = extract_youtube_id(url)
+    if not vid:
+        return None
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+        try:
+            segments = YouTubeTranscriptApi.get_transcript(vid)
+        except (TranscriptsDisabled, NoTranscriptFound):
+            return None
+        transcript = ' '.join(s['text'] for s in segments)
+        # Fetch metadata without downloading
+        info_opts = {'quiet': True, 'skip_download': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return info.get('title', 'Untitled'), info.get('uploader', 'Unknown'), transcript
+    except Exception:
+        return None
+
+
 def download_audio(url: str, output_dir: str) -> tuple[str, str]:
     ydl_opts = {
         "format": "bestaudio/best",
@@ -239,7 +272,7 @@ def transcribe(audio_path: str) -> str:
         raise
 
 
-def summarize(transcript: str, raw_title: str) -> dict:
+def summarize(transcript: str, raw_title: str, full_transcript: bool = False) -> dict:
     """Returns { title, concepts, actions, quotes, bullets, preview }."""
     response = get_groq_client().chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -262,10 +295,10 @@ def summarize(transcript: str, raw_title: str) -> dict:
             },
             {
                 "role": "user",
-                "content": f"Raw title from video: {raw_title}\n\nTranscript:\n{transcript[:8000]}",
+                "content": f"Raw title from video: {raw_title}\n\nTranscript:\n{transcript[:32000] if full_transcript else transcript[:8000]}",
             },
         ],
-        max_tokens=900,
+        max_tokens=1200,
         response_format={"type": "json_object"},
     )
     try:
@@ -315,31 +348,43 @@ def health():
 @app.post("/capture")
 @limiter.limit("10/minute")
 async def capture(request: Request, req: CaptureRequest):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            title, uploader = download_audio(req.url, tmpdir)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+    title = "Untitled"
+    uploader = "Unknown"
+    transcript = ""
+    used_transcript_api = False
 
-        files = glob.glob(f"{tmpdir}/*.mp3")
-        if not files:
-            raise HTTPException(status_code=500, detail="Audio file not found after download")
+    # Fast path: YouTube Transcript API (free, instant, full text)
+    yt_result = get_youtube_transcript(req.url)
+    if yt_result:
+        title, uploader, transcript = yt_result
+        used_transcript_api = True
 
-        try:
-            transcript = transcribe(files[0])
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    if not used_transcript_api:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                title, uploader = download_audio(req.url, tmpdir)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
-        summary = summarize(transcript, title)
-        clean_title = summary["title"]
-        bullets = summary["bullets"]
-        preview = "\n".join(f"• {b}" for b in bullets)
+            files = glob.glob(f"{tmpdir}/*.mp3")
+            if not files:
+                raise HTTPException(status_code=500, detail="Audio file not found after download")
 
-        date = datetime.now().strftime("%Y-%m-%d")
-        safe_title = re.sub(r"[^\w\s-]", "", clean_title).strip().replace(" ", "-")[:60]
-        filename = f"{date}-{safe_title}.md"
+            try:
+                transcript = transcribe(files[0])
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
-        note = f"""# {clean_title}
+    summary = summarize(transcript, title, full_transcript=used_transcript_api)
+    clean_title = summary["title"]
+    bullets = summary["bullets"]
+    preview = "\n".join(f"• {b}" for b in bullets)
+
+    date = datetime.now().strftime("%Y-%m-%d")
+    safe_title = re.sub(r"[^\w\s-]", "", clean_title).strip().replace(" ", "-")[:60]
+    filename = f"{date}-{safe_title}.md"
+
+    note = f"""# {clean_title}
 **Source:** {req.url}
 **Creator:** {uploader}
 **Captured:** {datetime.now().strftime("%B %d, %Y")}
@@ -357,25 +402,79 @@ async def capture(request: Request, req: CaptureRequest):
 {transcript}
 """
 
-        note_url = None
-        try:
-            note_url = push_to_github(filename, note)
-        except Exception:
-            pass  # GitHub push is optional — capture still succeeds without it
+    note_url = None
+    try:
+        note_url = push_to_github(filename, note)
+    except Exception:
+        pass
 
-        return {
-            "success": True,
-            "title": clean_title,
-            "note_url": note_url or "",
-            "preview": preview,
-            "bullets": summary["bullets"],
-            "category": summary["category"],
-            "concepts": summary["concepts"],
-            "actions": summary["actions"],
-            "quotes": summary["quotes"],
-            "transcript": transcript,
-            "creator": uploader,
-        }
+    return {
+        "success": True,
+        "title": clean_title,
+        "note_url": note_url or "",
+        "preview": preview,
+        "bullets": summary["bullets"],
+        "category": summary["category"],
+        "concepts": summary["concepts"],
+        "actions": summary["actions"],
+        "quotes": summary["quotes"],
+        "transcript": transcript,
+        "creator": uploader,
+    }
+
+
+@app.post("/capture/paste")
+@limiter.limit("20/minute")
+async def capture_paste(request: Request, req: PasteTranscriptRequest):
+    """Capture from pasted text — blog posts, scripts, newsletters, notes."""
+    if not req.text or len(req.text.strip()) < 50:
+        raise HTTPException(status_code=400, detail="Please paste at least a few sentences of content.")
+
+    summary = summarize(req.text, req.title, full_transcript=True)
+    clean_title = summary["title"]
+    bullets = summary["bullets"]
+    preview = "\n".join(f"• {b}" for b in bullets)
+
+    date = datetime.now().strftime("%Y-%m-%d")
+    safe_title = re.sub(r"[^\w\s-]", "", clean_title).strip().replace(" ", "-")[:60]
+    filename = f"{date}-{safe_title}.md"
+
+    note = f"""# {clean_title}
+**Source:** {req.source_url or req.platform or "Pasted text"}
+**Captured:** {datetime.now().strftime("%B %d, %Y")}
+
+---
+
+## Key Insights
+
+{preview}
+
+---
+
+## Full Content
+
+{req.text}
+"""
+
+    note_url = None
+    try:
+        note_url = push_to_github(filename, note)
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "title": clean_title,
+        "note_url": note_url or "",
+        "preview": preview,
+        "bullets": summary["bullets"],
+        "category": summary["category"],
+        "concepts": summary["concepts"],
+        "actions": summary["actions"],
+        "quotes": summary["quotes"],
+        "transcript": req.text,
+        "creator": req.platform or "Creator",
+    }
 
 
 @app.post("/push-map")

@@ -9,3 +9,4 @@ asyncpg
 bcrypt
 pyjwt
 python-dotenv
+youtube-transcript-api
