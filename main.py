@@ -3,6 +3,7 @@ import glob
 import re
 import json
 import base64
+import uuid as _uuid
 import tempfile
 import secrets
 import random
@@ -1001,8 +1002,8 @@ async def run_migrations():
         ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token TEXT;
         CREATE TABLE IF NOT EXISTS follows (
             id SERIAL PRIMARY KEY,
-            follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            following_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            follower_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            following_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             created_at TIMESTAMP DEFAULT NOW(),
             UNIQUE(follower_id, following_id)
         );
@@ -1010,7 +1011,7 @@ async def run_migrations():
         CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
         CREATE TABLE IF NOT EXISTS threads (
             id SERIAL PRIMARY KEY,
-            author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
             body TEXT NOT NULL,
             tags TEXT[] DEFAULT '{}',
@@ -1023,20 +1024,20 @@ async def run_migrations():
         CREATE TABLE IF NOT EXISTS thread_replies (
             id SERIAL PRIMARY KEY,
             thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-            author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             body TEXT NOT NULL,
             upvotes INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS thread_votes (
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
             vote INTEGER NOT NULL,
             PRIMARY KEY(user_id, thread_id)
         );
         CREATE TABLE IF NOT EXISTS reply_votes (
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             reply_id INTEGER NOT NULL REFERENCES thread_replies(id) ON DELETE CASCADE,
             PRIMARY KEY(user_id, reply_id)
         );
@@ -1045,7 +1046,7 @@ async def run_migrations():
         ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation_points INTEGER DEFAULT 0;
         CREATE TABLE IF NOT EXISTS creator_applications (
             id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             status TEXT DEFAULT 'pending',
             motivation TEXT NOT NULL,
             sample_content TEXT NOT NULL,
@@ -1056,7 +1057,7 @@ async def run_migrations():
         );
         CREATE TABLE IF NOT EXISTS packets (
             id SERIAL PRIMARY KEY,
-            author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
             description TEXT DEFAULT '',
             category TEXT DEFAULT 'founder',
@@ -1077,7 +1078,7 @@ async def run_migrations():
             created_at TIMESTAMP DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS packet_reads (
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
             read_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY(user_id, packet_id)
@@ -1117,6 +1118,11 @@ async def optional_user_id(
 HANDLE_RE = re.compile(r'^[a-z0-9_-]{3,30}$')
 
 
+def _uid(uid: str) -> _uuid.UUID:
+    """Convert JWT sub string to UUID for DB queries (users.id is UUID type)."""
+    return _uuid.UUID(uid)
+
+
 class UpdateProfileRequest(BaseModel):
     name: str | None = None
     bio: str | None = None
@@ -1143,7 +1149,7 @@ async def update_profile(req: UpdateProfileRequest, uid: str = Depends(current_u
         h = req.handle.lower().strip()
         if not HANDLE_RE.match(h):
             raise HTTPException(status_code=400, detail="Handle must be 3-30 chars, letters/numbers/underscore/hyphen only")
-        taken = await pool.fetchval("SELECT id FROM users WHERE handle=$1 AND id!=$2", h, int(uid))
+        taken = await pool.fetchval("SELECT id FROM users WHERE handle=$1 AND id!=$2", h, _uid(uid))
         if taken:
             raise HTTPException(status_code=409, detail="That handle is already taken")
         req.handle = h
@@ -1158,7 +1164,7 @@ async def update_profile(req: UpdateProfileRequest, uid: str = Depends(current_u
             RETURNING id, name, email, handle, bio, github_username, avatar_url,
                       creator_mode, youtube_url, twitter_url, newsletter_url, website_url,
                       follower_count, following_count""",
-        int(uid), *vals,
+        _uid(uid), *vals,
     )
     return _user_dict(user)
 
@@ -1169,7 +1175,7 @@ async def enable_creator(req: EnableCreatorRequest, uid: str = Depends(current_u
     if not HANDLE_RE.match(h):
         raise HTTPException(status_code=400, detail="Handle must be 3-30 chars, letters/numbers/underscore/hyphen only")
     pool = await get_pool()
-    taken = await pool.fetchval("SELECT id FROM users WHERE handle=$1 AND id!=$2", h, int(uid))
+    taken = await pool.fetchval("SELECT id FROM users WHERE handle=$1 AND id!=$2", h, _uid(uid))
     if taken:
         raise HTTPException(status_code=409, detail="That handle is already taken")
     user = await pool.fetchrow(
@@ -1181,7 +1187,7 @@ async def enable_creator(req: EnableCreatorRequest, uid: str = Depends(current_u
            RETURNING id, name, email, handle, bio, github_username, avatar_url,
                      creator_mode, youtube_url, twitter_url, newsletter_url, website_url,
                      follower_count, following_count""",
-        int(uid), h, req.bio, req.youtube_url, req.twitter_url, req.newsletter_url, req.website_url,
+        _uid(uid), h, req.bio, req.youtube_url, req.twitter_url, req.newsletter_url, req.website_url,
     )
     return _user_dict(user)
 
@@ -1231,9 +1237,9 @@ async def follow_user(user_id: int, uid: str = Depends(current_user_id)):
     if not target:
         raise HTTPException(status_code=404, detail="Creator not found")
     try:
-        await pool.execute("INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)", int(uid), user_id)
+        await pool.execute("INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)", _uid(uid), user_id)
         await pool.execute("UPDATE users SET follower_count = follower_count + 1 WHERE id=$1", user_id)
-        await pool.execute("UPDATE users SET following_count = following_count + 1 WHERE id=$1", int(uid))
+        await pool.execute("UPDATE users SET following_count = following_count + 1 WHERE id=$1", _uid(uid))
     except asyncpg.UniqueViolationError:
         pass  # already following
     return {"following": True}
@@ -1243,11 +1249,11 @@ async def follow_user(user_id: int, uid: str = Depends(current_user_id)):
 async def unfollow_user(user_id: int, uid: str = Depends(current_user_id)):
     pool = await get_pool()
     deleted = await pool.execute(
-        "DELETE FROM follows WHERE follower_id=$1 AND following_id=$2", int(uid), user_id
+        "DELETE FROM follows WHERE follower_id=$1 AND following_id=$2", _uid(uid), user_id
     )
     if deleted != "DELETE 0":
         await pool.execute("UPDATE users SET follower_count = GREATEST(0, follower_count - 1) WHERE id=$1", user_id)
-        await pool.execute("UPDATE users SET following_count = GREATEST(0, following_count - 1) WHERE id=$1", int(uid))
+        await pool.execute("UPDATE users SET following_count = GREATEST(0, following_count - 1) WHERE id=$1", _uid(uid))
     return {"following": False}
 
 
@@ -1355,7 +1361,7 @@ def _reply_row(r, my_voted: bool = False, is_author: bool = False) -> dict:
 @app.put("/auth/push-token")
 async def update_push_token(req: PushTokenRequest, uid: str = Depends(current_user_id)):
     pool = await get_pool()
-    await pool.execute("UPDATE users SET push_token=$1 WHERE id=$2", req.token, int(uid))
+    await pool.execute("UPDATE users SET push_token=$1 WHERE id=$2", req.token, _uid(uid))
     return {"ok": True}
 
 
@@ -1389,7 +1395,7 @@ async def list_threads(
         thread_ids = [r["id"] for r in rows]
         vote_rows = await pool.fetch(
             "SELECT thread_id, vote FROM thread_votes WHERE user_id=$1 AND thread_id=ANY($2)",
-            int(uid), thread_ids,
+            _uid(uid), thread_ids,
         )
         my_votes = {v["thread_id"]: v["vote"] for v in vote_rows}
 
@@ -1406,9 +1412,9 @@ async def create_thread(req: CreateThreadRequest, uid: str = Depends(current_use
         """INSERT INTO threads (author_id, title, body, tags)
            VALUES ($1, $2, $3, $4)
            RETURNING id, title, body, tags, author_id, upvotes, reply_count, is_resolved, created_at, updated_at""",
-        int(uid), req.title.strip(), req.body.strip(), tags,
+        _uid(uid), req.title.strip(), req.body.strip(), tags,
     )
-    user = await pool.fetchrow("SELECT name, handle FROM users WHERE id=$1", int(uid))
+    user = await pool.fetchrow("SELECT name, handle FROM users WHERE id=$1", _uid(uid))
     result = dict(row)
     result["author_name"] = user["name"]
     result["author_handle"] = user["handle"]
@@ -1444,14 +1450,14 @@ async def get_thread(thread_id: int, uid: str | None = Depends(optional_user_id)
     if uid:
         tv = await pool.fetchrow(
             "SELECT vote FROM thread_votes WHERE user_id=$1 AND thread_id=$2",
-            int(uid), thread_id,
+            _uid(uid), thread_id,
         )
         if tv:
             my_thread_vote = tv["vote"]
         if replies:
             rv = await pool.fetch(
                 "SELECT reply_id FROM reply_votes WHERE user_id=$1 AND reply_id=ANY($2)",
-                int(uid), [r["id"] for r in replies],
+                _uid(uid), [r["id"] for r in replies],
             )
             my_reply_votes = {v["reply_id"] for v in rv}
 
@@ -1505,18 +1511,18 @@ async def vote_thread(thread_id: int, vote: int, uid: str = Depends(current_user
     pool = await get_pool()
     existing = await pool.fetchrow(
         "SELECT vote FROM thread_votes WHERE user_id=$1 AND thread_id=$2",
-        int(uid), thread_id,
+        _uid(uid), thread_id,
     )
     if existing:
         if existing["vote"] == vote:
-            await pool.execute("DELETE FROM thread_votes WHERE user_id=$1 AND thread_id=$2", int(uid), thread_id)
+            await pool.execute("DELETE FROM thread_votes WHERE user_id=$1 AND thread_id=$2", _uid(uid), thread_id)
             await pool.execute("UPDATE threads SET upvotes=GREATEST(0,upvotes-$1) WHERE id=$2", vote, thread_id)
             return {"myVote": None}
         else:
-            await pool.execute("UPDATE thread_votes SET vote=$1 WHERE user_id=$2 AND thread_id=$3", vote, int(uid), thread_id)
+            await pool.execute("UPDATE thread_votes SET vote=$1 WHERE user_id=$2 AND thread_id=$3", vote, _uid(uid), thread_id)
             await pool.execute("UPDATE threads SET upvotes=upvotes+$1 WHERE id=$2", vote * 2, thread_id)
     else:
-        await pool.execute("INSERT INTO thread_votes(user_id,thread_id,vote) VALUES($1,$2,$3)", int(uid), thread_id, vote)
+        await pool.execute("INSERT INTO thread_votes(user_id,thread_id,vote) VALUES($1,$2,$3)", _uid(uid), thread_id, vote)
         await pool.execute("UPDATE threads SET upvotes=upvotes+$1 WHERE id=$2", vote, thread_id)
     new_votes = await pool.fetchval("SELECT upvotes FROM threads WHERE id=$1", thread_id)
     return {"myVote": vote, "upvotes": new_votes}
@@ -1545,12 +1551,12 @@ async def create_reply(thread_id: int, req: CreateReplyRequest, uid: str = Depen
     if thread["is_resolved"]:
         raise HTTPException(status_code=400, detail="Thread is resolved")
 
-    user = await pool.fetchrow("SELECT name, handle, push_token FROM users WHERE id=$1", int(uid))
+    user = await pool.fetchrow("SELECT name, handle, push_token FROM users WHERE id=$1", _uid(uid))
     row = await pool.fetchrow(
         """INSERT INTO thread_replies(thread_id, author_id, body)
            VALUES($1,$2,$3)
            RETURNING id, thread_id, body, author_id, upvotes, created_at, updated_at""",
-        thread_id, int(uid), req.body.strip(),
+        thread_id, _uid(uid), req.body.strip(),
     )
     await pool.execute("UPDATE threads SET reply_count=reply_count+1 WHERE id=$1", thread_id)
 
@@ -1602,15 +1608,15 @@ async def delete_reply(thread_id: int, reply_id: int, uid: str = Depends(current
 async def vote_reply(thread_id: int, reply_id: int, uid: str = Depends(current_user_id)):
     pool = await get_pool()
     existing = await pool.fetchrow(
-        "SELECT 1 FROM reply_votes WHERE user_id=$1 AND reply_id=$2", int(uid), reply_id,
+        "SELECT 1 FROM reply_votes WHERE user_id=$1 AND reply_id=$2", _uid(uid), reply_id,
     )
     if existing:
-        await pool.execute("DELETE FROM reply_votes WHERE user_id=$1 AND reply_id=$2", int(uid), reply_id)
+        await pool.execute("DELETE FROM reply_votes WHERE user_id=$1 AND reply_id=$2", _uid(uid), reply_id)
         await pool.execute("UPDATE thread_replies SET upvotes=GREATEST(0,upvotes-1) WHERE id=$1", reply_id)
         new_votes = await pool.fetchval("SELECT upvotes FROM thread_replies WHERE id=$1", reply_id)
         return {"myVote": False, "upvotes": new_votes}
     else:
-        await pool.execute("INSERT INTO reply_votes(user_id,reply_id) VALUES($1,$2)", int(uid), reply_id)
+        await pool.execute("INSERT INTO reply_votes(user_id,reply_id) VALUES($1,$2)", _uid(uid), reply_id)
         await pool.execute("UPDATE thread_replies SET upvotes=upvotes+1 WHERE id=$1", reply_id)
         new_votes = await pool.fetchval("SELECT upvotes FROM thread_replies WHERE id=$1", reply_id)
         return {"myVote": True, "upvotes": new_votes}
@@ -1623,7 +1629,7 @@ async def vote_reply(thread_id: int, reply_id: int, uid: str = Depends(current_u
 @app.put("/auth/reputation")
 async def sync_reputation(req: ReputationSyncRequest, uid: str = Depends(current_user_id)):
     pool = await get_pool()
-    await pool.execute("UPDATE users SET reputation_points=$1 WHERE id=$2", req.points, int(uid))
+    await pool.execute("UPDATE users SET reputation_points=$1 WHERE id=$2", req.points, _uid(uid))
     return {"ok": True}
 
 
@@ -1634,7 +1640,7 @@ async def sync_reputation(req: ReputationSyncRequest, uid: str = Depends(current
 @app.post("/creator/apply")
 async def creator_apply(req: CreatorApplicationRequest, uid: str = Depends(current_user_id)):
     pool = await get_pool()
-    user = await pool.fetchrow("SELECT reputation_points, creator_mode FROM users WHERE id=$1", int(uid))
+    user = await pool.fetchrow("SELECT reputation_points, creator_mode FROM users WHERE id=$1", _uid(uid))
     if user["creator_mode"]:
         raise HTTPException(status_code=400, detail="Already a creator")
 
@@ -1643,22 +1649,22 @@ async def creator_apply(req: CreatorApplicationRequest, uid: str = Depends(curre
     status = "approved" if auto_approve else "pending"
     reviewed_at = "NOW()" if auto_approve else "NULL"
 
-    existing = await pool.fetchrow("SELECT id, status FROM creator_applications WHERE user_id=$1", int(uid))
+    existing = await pool.fetchrow("SELECT id, status FROM creator_applications WHERE user_id=$1", _uid(uid))
     if existing:
         if existing["status"] == "approved":
             raise HTTPException(status_code=400, detail="Application already approved")
         await pool.execute(
             "UPDATE creator_applications SET status=$1, motivation=$2, sample_content=$3, reviewed_at=CASE WHEN $1='approved' THEN NOW() ELSE NULL END WHERE user_id=$4",
-            status, req.motivation, req.sample_content, int(uid),
+            status, req.motivation, req.sample_content, _uid(uid),
         )
     else:
         await pool.execute(
             "INSERT INTO creator_applications(user_id, status, motivation, sample_content, reviewed_at) VALUES($1,$2,$3,$4,CASE WHEN $2='approved' THEN NOW() ELSE NULL END)",
-            int(uid), status, req.motivation, req.sample_content,
+            _uid(uid), status, req.motivation, req.sample_content,
         )
 
     if auto_approve:
-        await pool.execute("UPDATE users SET creator_mode=TRUE, creator_enabled_at=NOW() WHERE id=$1", int(uid))
+        await pool.execute("UPDATE users SET creator_mode=TRUE, creator_enabled_at=NOW() WHERE id=$1", _uid(uid))
 
     return {"status": status, "autoApproved": auto_approve}
 
@@ -1668,7 +1674,7 @@ async def get_creator_application(uid: str = Depends(current_user_id)):
     pool = await get_pool()
     row = await pool.fetchrow(
         "SELECT id, status, rejection_reason, created_at, reviewed_at FROM creator_applications WHERE user_id=$1",
-        int(uid),
+        _uid(uid),
     )
     if not row:
         return {"status": "none"}
@@ -1720,7 +1726,7 @@ def _packet_row(p, chapters=None, is_subscriber=False) -> dict:
 
 
 async def _require_creator(uid: str, pool) -> None:
-    user = await pool.fetchrow("SELECT creator_mode FROM users WHERE id=$1", int(uid))
+    user = await pool.fetchrow("SELECT creator_mode FROM users WHERE id=$1", _uid(uid))
     if not user or not user["creator_mode"]:
         raise HTTPException(status_code=403, detail="Creator access required. Apply at /creator/apply")
 
@@ -1761,7 +1767,7 @@ async def my_packets(uid: str = Depends(current_user_id)):
         """SELECT p.*,
                (SELECT COUNT(*) FROM packet_chapters WHERE packet_id=p.id) AS chapter_count
            FROM packets p WHERE p.author_id=$1 ORDER BY p.created_at DESC""",
-        int(uid),
+        _uid(uid),
     )
     return [_packet_row(r) for r in rows]
 
@@ -1772,7 +1778,7 @@ async def create_packet(req: CreatePacketRequest, uid: str = Depends(current_use
     await _require_creator(uid, pool)
     row = await pool.fetchrow(
         "INSERT INTO packets(author_id,title,description,category,cover_emoji) VALUES($1,$2,$3,$4,$5) RETURNING *",
-        int(uid), req.title.strip(), req.description.strip(), req.category, req.cover_emoji,
+        _uid(uid), req.title.strip(), req.description.strip(), req.category, req.cover_emoji,
     )
     return _packet_row(row)
 
@@ -1869,11 +1875,11 @@ async def record_read(packet_id: int, uid: str = Depends(current_user_id)):
     if not row or row["status"] != "published":
         raise HTTPException(status_code=404, detail="Packet not found")
     existing = await pool.fetchrow(
-        "SELECT 1 FROM packet_reads WHERE user_id=$1 AND packet_id=$2", int(uid), packet_id,
+        "SELECT 1 FROM packet_reads WHERE user_id=$1 AND packet_id=$2", _uid(uid), packet_id,
     )
     if not existing:
         await pool.execute(
-            "INSERT INTO packet_reads(user_id,packet_id) VALUES($1,$2)", int(uid), packet_id,
+            "INSERT INTO packet_reads(user_id,packet_id) VALUES($1,$2)", _uid(uid), packet_id,
         )
         await pool.execute("UPDATE packets SET total_reads=total_reads+1 WHERE id=$1", packet_id)
     return {"ok": True}
