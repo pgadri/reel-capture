@@ -31,8 +31,14 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pgadri/my-captures")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+FROM_EMAIL = "hello@vibecoded.tech"
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 30
+OTP_TTL = 600       # 10 minutes
+OTP_MAX_ATTEMPTS = 3
 
 # ─── DB pool ─────────────────────────────────────────────────────────────────
 
@@ -89,6 +95,73 @@ class SigninRequest(BaseModel):
 class OTPVerifyRequest(BaseModel):
     email: str
     code: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+# ─── Redis helpers (Upstash REST) ─────────────────────────────────────────────
+
+def _redis_headers():
+    return {"Authorization": f"Bearer {REDIS_TOKEN}"}
+
+def redis_set(key: str, value: str, ex: int = OTP_TTL):
+    requests.post(f"{REDIS_URL}/set/{key}/{value}/ex/{ex}", headers=_redis_headers(), timeout=5)
+
+def redis_get(key: str) -> str | None:
+    r = requests.get(f"{REDIS_URL}/get/{key}", headers=_redis_headers(), timeout=5)
+    return r.json().get("result")
+
+def redis_del(key: str):
+    requests.post(f"{REDIS_URL}/del/{key}", headers=_redis_headers(), timeout=5)
+
+def redis_incr(key: str) -> int:
+    r = requests.post(f"{REDIS_URL}/incr/{key}", headers=_redis_headers(), timeout=5)
+    return r.json().get("result", 0)
+
+# ─── OTP helpers ─────────────────────────────────────────────────────────────
+
+def generate_otp() -> str:
+    return f"{random.randint(0, 999999):06d}"
+
+def otp_key(email: str, kind: str) -> str:
+    return f"otp:{kind}:{email.lower()}"
+
+def attempts_key(email: str, kind: str) -> str:
+    return f"otp_attempts:{kind}:{email.lower()}"
+
+def send_otp_email(to_email: str, name: str, code: str, kind: str = "verify"):
+    if kind == "verify":
+        subject = "Your Vibecoded verification code"
+        body = f"""
+        <div style="font-family:sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#2A1B5E">Verify your email</h2>
+          <p>Hi {name}, welcome to Vibecoded.</p>
+          <p>Your verification code is:</p>
+          <div style="font-size:36px;font-weight:800;letter-spacing:8px;color:#2A1B5E;padding:20px 0">{code}</div>
+          <p style="color:#888">Valid for 10 minutes. Don't share this code with anyone.</p>
+        </div>"""
+    else:
+        subject = "Reset your Vibecoded password"
+        body = f"""
+        <div style="font-family:sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#2A1B5E">Reset your password</h2>
+          <p>Hi {name}, we received a request to reset your password.</p>
+          <p>Your reset code is:</p>
+          <div style="font-size:36px;font-weight:800;letter-spacing:8px;color:#2A1B5E;padding:20px 0">{code}</div>
+          <p style="color:#888">Valid for 10 minutes. If you didn't request this, ignore this email.</p>
+        </div>"""
+
+    requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json={"from": f"Vibecoded <{FROM_EMAIL}>", "to": [to_email], "subject": subject, "html": body},
+        timeout=10,
+    )
 
 
 def get_groq_client():
@@ -600,17 +673,78 @@ async def signup(req: SignupRequest, request: Request):
     if len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
     pool = await get_pool()
-    existing = await pool.fetchrow("SELECT id FROM users WHERE email = $1", req.email.lower())
-    if existing:
+    existing = await pool.fetchrow("SELECT id, email_verified FROM users WHERE email = $1", req.email.lower())
+    if existing and existing["email_verified"]:
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
     pw_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+    email = req.email.lower().strip()
+    name = req.name.strip()
+
+    if existing:
+        await pool.execute("UPDATE users SET name=$1, password_hash=$2 WHERE email=$3", name, pw_hash, email)
+    else:
+        await pool.execute(
+            "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3)",
+            name, email, pw_hash,
+        )
+
+    code = generate_otp()
+    redis_set(otp_key(email, "verify"), code)
+    redis_del(attempts_key(email, "verify"))
+    send_otp_email(email, name, code, "verify")
+    return {"message": "Verification code sent", "email": email}
+
+
+@app.post("/auth/verify-otp")
+@limiter.limit("10/minute")
+async def verify_otp(req: OTPVerifyRequest, request: Request):
+    email = req.email.lower().strip()
+    key = otp_key(email, "verify")
+    att_key = attempts_key(email, "verify")
+
+    attempts = int(redis_get(att_key) or 0)
+    if attempts >= OTP_MAX_ATTEMPTS:
+        redis_del(key)
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+    stored = redis_get(key)
+    if not stored:
+        raise HTTPException(status_code=400, detail="Code expired or not found. Request a new one.")
+
+    if stored != req.code.strip():
+        redis_incr(att_key)
+        requests.post(f"{REDIS_URL}/expire/{att_key}/{OTP_TTL}", headers=_redis_headers(), timeout=5)
+        remaining = OTP_MAX_ATTEMPTS - attempts - 1
+        raise HTTPException(status_code=400, detail=f"Wrong code. {remaining} attempt{'s' if remaining != 1 else ''} left.")
+
+    redis_del(key)
+    redis_del(att_key)
+    pool = await get_pool()
     user = await pool.fetchrow(
-        "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email",
-        req.name.strip(), req.email.lower().strip(), pw_hash,
+        "UPDATE users SET email_verified=true WHERE email=$1 RETURNING id, name, email",
+        email,
     )
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+
     token = create_token(str(user["id"]))
     return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
+
+
+@app.post("/auth/resend-otp")
+@limiter.limit("3/minute")
+async def resend_otp(req: ForgotPasswordRequest, request: Request):
+    email = req.email.lower().strip()
+    pool = await get_pool()
+    user = await pool.fetchrow("SELECT name FROM users WHERE email=$1", email)
+    if not user:
+        return {"message": "If that email exists, a code was sent"}
+    code = generate_otp()
+    redis_set(otp_key(email, "verify"), code)
+    redis_del(attempts_key(email, "verify"))
+    send_otp_email(email, user["name"], code, "verify")
+    return {"message": "New code sent"}
 
 
 @app.post("/auth/signin")
@@ -618,14 +752,67 @@ async def signup(req: SignupRequest, request: Request):
 async def signin(req: SigninRequest, request: Request):
     pool = await get_pool()
     user = await pool.fetchrow(
-        "SELECT id, name, email, password_hash FROM users WHERE email = $1",
+        "SELECT id, name, email, password_hash, email_verified FROM users WHERE email=$1",
         req.email.lower().strip(),
     )
     if not user or not user["password_hash"]:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not bcrypt.checkpw(req.password.encode(), user["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not user["email_verified"]:
+        code = generate_otp()
+        redis_set(otp_key(req.email.lower(), "verify"), code)
+        redis_del(attempts_key(req.email.lower(), "verify"))
+        send_otp_email(user["email"], user["name"], code, "verify")
+        return {"unverified": True, "email": user["email"], "message": "Please verify your email first"}
 
+    token = create_token(str(user["id"]))
+    return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
+
+
+@app.post("/auth/forgot-password")
+@limiter.limit("3/minute")
+async def forgot_password(req: ForgotPasswordRequest, request: Request):
+    email = req.email.lower().strip()
+    pool = await get_pool()
+    user = await pool.fetchrow("SELECT name FROM users WHERE email=$1 AND email_verified=true", email)
+    if user:
+        code = generate_otp()
+        redis_set(otp_key(email, "reset"), code)
+        redis_del(attempts_key(email, "reset"))
+        send_otp_email(email, user["name"], code, "reset")
+    return {"message": "If that email has an account, a reset code was sent"}
+
+
+@app.post("/auth/reset-password")
+@limiter.limit("5/minute")
+async def reset_password(req: ResetPasswordRequest, request: Request):
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    email = req.email.lower().strip()
+    key = otp_key(email, "reset")
+    att_key = attempts_key(email, "reset")
+
+    attempts = int(redis_get(att_key) or 0)
+    if attempts >= OTP_MAX_ATTEMPTS:
+        redis_del(key)
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+    stored = redis_get(key)
+    if not stored or stored != req.code.strip():
+        redis_incr(att_key)
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    redis_del(key)
+    redis_del(att_key)
+    pw_hash = bcrypt.hashpw(req.new_password.encode(), bcrypt.gensalt()).decode()
+    pool = await get_pool()
+    user = await pool.fetchrow(
+        "UPDATE users SET password_hash=$1 WHERE email=$2 RETURNING id, name, email",
+        pw_hash, email,
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
     token = create_token(str(user["id"]))
     return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
 
@@ -633,7 +820,7 @@ async def signin(req: SigninRequest, request: Request):
 @app.get("/auth/me")
 async def me(uid: str = Depends(current_user_id)):
     pool = await get_pool()
-    user = await pool.fetchrow("SELECT id, name, email, github_username, avatar_url FROM users WHERE id = $1", uid)
+    user = await pool.fetchrow("SELECT id, name, email, github_username, avatar_url FROM users WHERE id=$1", uid)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {"id": str(user["id"]), "name": user["name"], "email": user["email"],
