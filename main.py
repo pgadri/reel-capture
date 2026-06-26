@@ -820,8 +820,605 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
 @app.get("/auth/me")
 async def me(uid: str = Depends(current_user_id)):
     pool = await get_pool()
-    user = await pool.fetchrow("SELECT id, name, email, github_username, avatar_url FROM users WHERE id=$1", uid)
+    user = await pool.fetchrow(
+        """SELECT id, name, email, handle, bio, github_username, avatar_url,
+                  creator_mode, youtube_url, twitter_url, newsletter_url, website_url,
+                  follower_count, following_count
+           FROM users WHERE id=$1""",
+        uid,
+    )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return {"id": str(user["id"]), "name": user["name"], "email": user["email"],
-            "githubUsername": user["github_username"], "avatarUrl": user["avatar_url"]}
+    return _user_dict(user)
+
+
+# ─── Creator Mode ─────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def run_migrations():
+    pool = await get_pool()
+    await pool.execute("""
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS handle VARCHAR(50) UNIQUE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS creator_mode BOOLEAN DEFAULT FALSE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS youtube_url TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS twitter_url TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS newsletter_url TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS website_url TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS creator_enabled_at TIMESTAMP;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS follower_count INTEGER DEFAULT 0;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS following_count INTEGER DEFAULT 0;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token TEXT;
+        CREATE TABLE IF NOT EXISTS follows (
+            id SERIAL PRIMARY KEY,
+            follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            following_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(follower_id, following_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
+        CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
+        CREATE TABLE IF NOT EXISTS threads (
+            id SERIAL PRIMARY KEY,
+            author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            tags TEXT[] DEFAULT '{}',
+            upvotes INTEGER DEFAULT 0,
+            reply_count INTEGER DEFAULT 0,
+            is_resolved BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS thread_replies (
+            id SERIAL PRIMARY KEY,
+            thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            body TEXT NOT NULL,
+            upvotes INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS thread_votes (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            vote INTEGER NOT NULL,
+            PRIMARY KEY(user_id, thread_id)
+        );
+        CREATE TABLE IF NOT EXISTS reply_votes (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            reply_id INTEGER NOT NULL REFERENCES thread_replies(id) ON DELETE CASCADE,
+            PRIMARY KEY(user_id, reply_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_replies_thread ON thread_replies(thread_id, created_at);
+    """)
+
+
+def _user_dict(user) -> dict:
+    return {
+        "id": str(user["id"]),
+        "name": user["name"],
+        "email": user["email"],
+        "handle": user["handle"],
+        "bio": user["bio"],
+        "githubUsername": user.get("github_username"),
+        "avatarUrl": user.get("avatar_url"),
+        "creatorMode": user["creator_mode"],
+        "youtubeUrl": user["youtube_url"],
+        "twitterUrl": user["twitter_url"],
+        "newsletterUrl": user["newsletter_url"],
+        "websiteUrl": user["website_url"],
+        "followerCount": user["follower_count"],
+        "followingCount": user["following_count"],
+    }
+
+
+async def optional_user_id(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> str | None:
+    if not creds:
+        return None
+    return decode_token(creds.credentials)
+
+
+HANDLE_RE = re.compile(r'^[a-z0-9_-]{3,30}$')
+
+
+class UpdateProfileRequest(BaseModel):
+    name: str | None = None
+    bio: str | None = None
+    handle: str | None = None
+    youtube_url: str | None = None
+    twitter_url: str | None = None
+    newsletter_url: str | None = None
+    website_url: str | None = None
+
+
+class EnableCreatorRequest(BaseModel):
+    handle: str
+    bio: str | None = None
+    youtube_url: str | None = None
+    twitter_url: str | None = None
+    newsletter_url: str | None = None
+    website_url: str | None = None
+
+
+@app.put("/auth/profile")
+async def update_profile(req: UpdateProfileRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    if req.handle is not None:
+        h = req.handle.lower().strip()
+        if not HANDLE_RE.match(h):
+            raise HTTPException(status_code=400, detail="Handle must be 3-30 chars, letters/numbers/underscore/hyphen only")
+        taken = await pool.fetchval("SELECT id FROM users WHERE handle=$1 AND id!=$2", h, int(uid))
+        if taken:
+            raise HTTPException(status_code=409, detail="That handle is already taken")
+        req.handle = h
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    cols = ", ".join(f"{k}=${i+2}" for i, k in enumerate(updates))
+    vals = list(updates.values())
+    user = await pool.fetchrow(
+        f"""UPDATE users SET {cols}
+            WHERE id=$1
+            RETURNING id, name, email, handle, bio, github_username, avatar_url,
+                      creator_mode, youtube_url, twitter_url, newsletter_url, website_url,
+                      follower_count, following_count""",
+        int(uid), *vals,
+    )
+    return _user_dict(user)
+
+
+@app.post("/creator/enable")
+async def enable_creator(req: EnableCreatorRequest, uid: str = Depends(current_user_id)):
+    h = req.handle.lower().strip()
+    if not HANDLE_RE.match(h):
+        raise HTTPException(status_code=400, detail="Handle must be 3-30 chars, letters/numbers/underscore/hyphen only")
+    pool = await get_pool()
+    taken = await pool.fetchval("SELECT id FROM users WHERE handle=$1 AND id!=$2", h, int(uid))
+    if taken:
+        raise HTTPException(status_code=409, detail="That handle is already taken")
+    user = await pool.fetchrow(
+        """UPDATE users
+           SET handle=$2, bio=$3, youtube_url=$4, twitter_url=$5,
+               newsletter_url=$6, website_url=$7,
+               creator_mode=TRUE, creator_enabled_at=NOW()
+           WHERE id=$1
+           RETURNING id, name, email, handle, bio, github_username, avatar_url,
+                     creator_mode, youtube_url, twitter_url, newsletter_url, website_url,
+                     follower_count, following_count""",
+        int(uid), h, req.bio, req.youtube_url, req.twitter_url, req.newsletter_url, req.website_url,
+    )
+    return _user_dict(user)
+
+
+@app.get("/creator/{handle}")
+async def get_creator_profile(handle: str, viewer_id: str | None = Depends(optional_user_id)):
+    pool = await get_pool()
+    user = await pool.fetchrow(
+        """SELECT id, name, email, handle, bio, avatar_url,
+                  creator_mode, youtube_url, twitter_url, newsletter_url, website_url,
+                  follower_count, following_count, creator_enabled_at
+           FROM users WHERE handle=$1 AND creator_mode=TRUE""",
+        handle.lower(),
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    result = {
+        "id": str(user["id"]),
+        "name": user["name"],
+        "handle": user["handle"],
+        "bio": user["bio"],
+        "avatarUrl": user["avatar_url"],
+        "youtubeUrl": user["youtube_url"],
+        "twitterUrl": user["twitter_url"],
+        "newsletterUrl": user["newsletter_url"],
+        "websiteUrl": user["website_url"],
+        "followerCount": user["follower_count"],
+        "followingCount": user["following_count"],
+        "creatorSince": user["creator_enabled_at"].isoformat() if user["creator_enabled_at"] else None,
+        "isFollowing": False,
+    }
+    if viewer_id:
+        is_following = await pool.fetchval(
+            "SELECT 1 FROM follows WHERE follower_id=$1 AND following_id=$2",
+            int(viewer_id), int(user["id"]),
+        )
+        result["isFollowing"] = bool(is_following)
+    return result
+
+
+@app.post("/users/{user_id}/follow")
+async def follow_user(user_id: int, uid: str = Depends(current_user_id)):
+    if str(user_id) == uid:
+        raise HTTPException(status_code=400, detail="You can't follow yourself")
+    pool = await get_pool()
+    target = await pool.fetchval("SELECT id FROM users WHERE id=$1 AND creator_mode=TRUE", user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    try:
+        await pool.execute("INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)", int(uid), user_id)
+        await pool.execute("UPDATE users SET follower_count = follower_count + 1 WHERE id=$1", user_id)
+        await pool.execute("UPDATE users SET following_count = following_count + 1 WHERE id=$1", int(uid))
+    except asyncpg.UniqueViolationError:
+        pass  # already following
+    return {"following": True}
+
+
+@app.delete("/users/{user_id}/follow")
+async def unfollow_user(user_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    deleted = await pool.execute(
+        "DELETE FROM follows WHERE follower_id=$1 AND following_id=$2", int(uid), user_id
+    )
+    if deleted != "DELETE 0":
+        await pool.execute("UPDATE users SET follower_count = GREATEST(0, follower_count - 1) WHERE id=$1", user_id)
+        await pool.execute("UPDATE users SET following_count = GREATEST(0, following_count - 1) WHERE id=$1", int(uid))
+    return {"following": False}
+
+
+@app.get("/creator/{handle}/followers")
+async def get_creator_followers(handle: str, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    creator = await pool.fetchrow("SELECT id FROM users WHERE handle=$1 AND creator_mode=TRUE", handle.lower())
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    rows = await pool.fetch(
+        """SELECT u.id, u.name, u.handle, u.avatar_url, u.creator_mode
+           FROM follows f JOIN users u ON u.id = f.follower_id
+           WHERE f.following_id=$1 ORDER BY f.created_at DESC LIMIT 50""",
+        creator["id"],
+    )
+    return [{"id": str(r["id"]), "name": r["name"], "handle": r["handle"],
+             "avatarUrl": r["avatar_url"], "creatorMode": r["creator_mode"]} for r in rows]
+
+
+@app.get("/creator/{handle}/following")
+async def get_creator_following(handle: str, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    creator = await pool.fetchrow("SELECT id FROM users WHERE handle=$1", handle.lower())
+    if not creator:
+        raise HTTPException(status_code=404, detail="User not found")
+    rows = await pool.fetch(
+        """SELECT u.id, u.name, u.handle, u.avatar_url, u.creator_mode
+           FROM follows f JOIN users u ON u.id = f.following_id
+           WHERE f.follower_id=$1 ORDER BY f.created_at DESC LIMIT 50""",
+        creator["id"],
+    )
+    return [{"id": str(r["id"]), "name": r["name"], "handle": r["handle"],
+             "avatarUrl": r["avatar_url"], "creatorMode": r["creator_mode"]} for r in rows]
+
+
+# ─── Threads ──────────────────────────────────────────────────────────────────
+
+class CreateThreadRequest(BaseModel):
+    title: str
+    body: str
+    tags: list[str] = []
+
+class UpdateThreadRequest(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    tags: list[str] | None = None
+
+class CreateReplyRequest(BaseModel):
+    body: str
+
+class UpdateReplyRequest(BaseModel):
+    body: str
+
+class PushTokenRequest(BaseModel):
+    token: str
+
+
+def _send_push(token: str | None, title: str, body: str):
+    if not token or not token.startswith("ExponentPushToken"):
+        return
+    try:
+        requests.post(
+            "https://exp.host/--/api/v2/push/send",
+            json={"to": token, "title": title, "body": body, "sound": "default"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _thread_row(t, my_vote: int | None = None) -> dict:
+    return {
+        "id": str(t["id"]),
+        "title": t["title"],
+        "body": t["body"],
+        "tags": list(t["tags"]) if t["tags"] else [],
+        "authorId": str(t["author_id"]),
+        "authorName": t["author_name"],
+        "authorHandle": t["author_handle"],
+        "createdAt": t["created_at"].isoformat(),
+        "updatedAt": t["updated_at"].isoformat() if t.get("updated_at") else None,
+        "upvotes": t["upvotes"],
+        "replyCount": t["reply_count"],
+        "isResolved": t["is_resolved"],
+        "myVote": my_vote,
+    }
+
+
+def _reply_row(r, my_voted: bool = False, is_author: bool = False) -> dict:
+    return {
+        "id": str(r["id"]),
+        "threadId": str(r["thread_id"]),
+        "body": r["body"],
+        "authorId": str(r["author_id"]),
+        "authorName": r["author_name"],
+        "authorHandle": r["author_handle"],
+        "createdAt": r["created_at"].isoformat(),
+        "updatedAt": r["updated_at"].isoformat() if r.get("updated_at") else None,
+        "upvotes": r["upvotes"],
+        "myVote": my_voted,
+        "isAuthor": is_author,
+    }
+
+
+@app.put("/auth/push-token")
+async def update_push_token(req: PushTokenRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    await pool.execute("UPDATE users SET push_token=$1 WHERE id=$2", req.token, int(uid))
+    return {"ok": True}
+
+
+@app.get("/threads")
+async def list_threads(
+    tag: str | None = None,
+    offset: int = 0,
+    limit: int = 30,
+    uid: str | None = Depends(optional_user_id),
+):
+    pool = await get_pool()
+    where = "WHERE t.updated_at IS NULL OR TRUE"
+    args: list = []
+    if tag:
+        where = "WHERE $1 = ANY(t.tags)"
+        args.append(tag)
+
+    rows = await pool.fetch(
+        f"""SELECT t.id, t.title, t.body, t.tags, t.author_id, t.upvotes,
+                   t.reply_count, t.is_resolved, t.created_at, t.updated_at,
+                   u.name AS author_name, u.handle AS author_handle
+            FROM threads t JOIN users u ON u.id = t.author_id
+            {where}
+            ORDER BY t.created_at DESC
+            LIMIT ${len(args)+1} OFFSET ${len(args)+2}""",
+        *args, limit, offset,
+    )
+
+    my_votes: dict[int, int] = {}
+    if uid and rows:
+        thread_ids = [r["id"] for r in rows]
+        vote_rows = await pool.fetch(
+            "SELECT thread_id, vote FROM thread_votes WHERE user_id=$1 AND thread_id=ANY($2)",
+            int(uid), thread_ids,
+        )
+        my_votes = {v["thread_id"]: v["vote"] for v in vote_rows}
+
+    return [_thread_row(r, my_votes.get(r["id"])) for r in rows]
+
+
+@app.post("/threads")
+async def create_thread(req: CreateThreadRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    if not req.title.strip() or not req.body.strip():
+        raise HTTPException(status_code=400, detail="Title and body required")
+    tags = [t.lower().strip() for t in req.tags[:5] if t.strip()]
+    row = await pool.fetchrow(
+        """INSERT INTO threads (author_id, title, body, tags)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id, title, body, tags, author_id, upvotes, reply_count, is_resolved, created_at, updated_at""",
+        int(uid), req.title.strip(), req.body.strip(), tags,
+    )
+    user = await pool.fetchrow("SELECT name, handle FROM users WHERE id=$1", int(uid))
+    result = dict(row)
+    result["author_name"] = user["name"]
+    result["author_handle"] = user["handle"]
+    return _thread_row(result)
+
+
+@app.get("/threads/{thread_id}")
+async def get_thread(thread_id: int, uid: str | None = Depends(optional_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """SELECT t.id, t.title, t.body, t.tags, t.author_id, t.upvotes,
+                  t.reply_count, t.is_resolved, t.created_at, t.updated_at,
+                  u.name AS author_name, u.handle AS author_handle
+           FROM threads t JOIN users u ON u.id = t.author_id
+           WHERE t.id=$1""",
+        thread_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    replies = await pool.fetch(
+        """SELECT r.id, r.thread_id, r.body, r.author_id, r.upvotes,
+                  r.created_at, r.updated_at,
+                  u.name AS author_name, u.handle AS author_handle
+           FROM thread_replies r JOIN users u ON u.id = r.author_id
+           WHERE r.thread_id=$1
+           ORDER BY r.created_at ASC""",
+        thread_id,
+    )
+
+    my_thread_vote: int | None = None
+    my_reply_votes: set[int] = set()
+    if uid:
+        tv = await pool.fetchrow(
+            "SELECT vote FROM thread_votes WHERE user_id=$1 AND thread_id=$2",
+            int(uid), thread_id,
+        )
+        if tv:
+            my_thread_vote = tv["vote"]
+        if replies:
+            rv = await pool.fetch(
+                "SELECT reply_id FROM reply_votes WHERE user_id=$1 AND reply_id=ANY($2)",
+                int(uid), [r["id"] for r in replies],
+            )
+            my_reply_votes = {v["reply_id"] for v in rv}
+
+    return {
+        **_thread_row(row, my_thread_vote),
+        "replies": [
+            _reply_row(r, r["id"] in my_reply_votes, uid is not None and str(r["author_id"]) == uid)
+            for r in replies
+        ],
+    }
+
+
+@app.put("/threads/{thread_id}")
+async def update_thread(thread_id: int, req: UpdateThreadRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id FROM threads WHERE id=$1", thread_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your thread")
+    updates, args = [], [thread_id]
+    if req.title is not None:
+        args.append(req.title.strip()); updates.append(f"title=${len(args)}")
+    if req.body is not None:
+        args.append(req.body.strip()); updates.append(f"body=${len(args)}")
+    if req.tags is not None:
+        args.append([t.lower().strip() for t in req.tags[:5]]); updates.append(f"tags=${len(args)}")
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    args.append(datetime.utcnow()); updates.append(f"updated_at=${len(args)}")
+    await pool.execute(f"UPDATE threads SET {', '.join(updates)} WHERE id=$1", *args)
+    return {"ok": True}
+
+
+@app.delete("/threads/{thread_id}")
+async def delete_thread(thread_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id FROM threads WHERE id=$1", thread_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your thread")
+    await pool.execute("DELETE FROM threads WHERE id=$1", thread_id)
+    return {"ok": True}
+
+
+@app.post("/threads/{thread_id}/vote")
+async def vote_thread(thread_id: int, vote: int, uid: str = Depends(current_user_id)):
+    if vote not in (1, -1):
+        raise HTTPException(status_code=400, detail="vote must be 1 or -1")
+    pool = await get_pool()
+    existing = await pool.fetchrow(
+        "SELECT vote FROM thread_votes WHERE user_id=$1 AND thread_id=$2",
+        int(uid), thread_id,
+    )
+    if existing:
+        if existing["vote"] == vote:
+            await pool.execute("DELETE FROM thread_votes WHERE user_id=$1 AND thread_id=$2", int(uid), thread_id)
+            await pool.execute("UPDATE threads SET upvotes=GREATEST(0,upvotes-$1) WHERE id=$2", vote, thread_id)
+            return {"myVote": None}
+        else:
+            await pool.execute("UPDATE thread_votes SET vote=$1 WHERE user_id=$2 AND thread_id=$3", vote, int(uid), thread_id)
+            await pool.execute("UPDATE threads SET upvotes=upvotes+$1 WHERE id=$2", vote * 2, thread_id)
+    else:
+        await pool.execute("INSERT INTO thread_votes(user_id,thread_id,vote) VALUES($1,$2,$3)", int(uid), thread_id, vote)
+        await pool.execute("UPDATE threads SET upvotes=upvotes+$1 WHERE id=$2", vote, thread_id)
+    new_votes = await pool.fetchval("SELECT upvotes FROM threads WHERE id=$1", thread_id)
+    return {"myVote": vote, "upvotes": new_votes}
+
+
+@app.post("/threads/{thread_id}/resolve")
+async def resolve_thread_api(thread_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id FROM threads WHERE id=$1", thread_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your thread")
+    await pool.execute("UPDATE threads SET is_resolved=TRUE WHERE id=$1", thread_id)
+    return {"ok": True}
+
+
+@app.post("/threads/{thread_id}/replies")
+async def create_reply(thread_id: int, req: CreateReplyRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    if not req.body.strip():
+        raise HTTPException(status_code=400, detail="Body required")
+    thread = await pool.fetchrow("SELECT author_id, title, is_resolved FROM threads WHERE id=$1", thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread["is_resolved"]:
+        raise HTTPException(status_code=400, detail="Thread is resolved")
+
+    user = await pool.fetchrow("SELECT name, handle, push_token FROM users WHERE id=$1", int(uid))
+    row = await pool.fetchrow(
+        """INSERT INTO thread_replies(thread_id, author_id, body)
+           VALUES($1,$2,$3)
+           RETURNING id, thread_id, body, author_id, upvotes, created_at, updated_at""",
+        thread_id, int(uid), req.body.strip(),
+    )
+    await pool.execute("UPDATE threads SET reply_count=reply_count+1 WHERE id=$1", thread_id)
+
+    # Push notification to thread author (not self)
+    if str(thread["author_id"]) != uid:
+        author = await pool.fetchrow("SELECT push_token FROM users WHERE id=$1", thread["author_id"])
+        if author and author["push_token"]:
+            _send_push(
+                author["push_token"],
+                f"{user['name']} replied",
+                thread["title"],
+            )
+
+    result = dict(row)
+    result["author_name"] = user["name"]
+    result["author_handle"] = user["handle"]
+    return _reply_row(result, False, True)
+
+
+@app.put("/threads/{thread_id}/replies/{reply_id}")
+async def update_reply(thread_id: int, reply_id: int, req: UpdateReplyRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id FROM thread_replies WHERE id=$1 AND thread_id=$2", reply_id, thread_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Reply not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your reply")
+    await pool.execute(
+        "UPDATE thread_replies SET body=$1, updated_at=$2 WHERE id=$3",
+        req.body.strip(), datetime.utcnow(), reply_id,
+    )
+    return {"ok": True}
+
+
+@app.delete("/threads/{thread_id}/replies/{reply_id}")
+async def delete_reply(thread_id: int, reply_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT author_id FROM thread_replies WHERE id=$1 AND thread_id=$2", reply_id, thread_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Reply not found")
+    if str(row["author_id"]) != uid:
+        raise HTTPException(status_code=403, detail="Not your reply")
+    await pool.execute("DELETE FROM thread_replies WHERE id=$1", reply_id)
+    await pool.execute("UPDATE threads SET reply_count=GREATEST(0,reply_count-1) WHERE id=$1", thread_id)
+    return {"ok": True}
+
+
+@app.post("/threads/{thread_id}/replies/{reply_id}/vote")
+async def vote_reply(thread_id: int, reply_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    existing = await pool.fetchrow(
+        "SELECT 1 FROM reply_votes WHERE user_id=$1 AND reply_id=$2", int(uid), reply_id,
+    )
+    if existing:
+        await pool.execute("DELETE FROM reply_votes WHERE user_id=$1 AND reply_id=$2", int(uid), reply_id)
+        await pool.execute("UPDATE thread_replies SET upvotes=GREATEST(0,upvotes-1) WHERE id=$1", reply_id)
+        new_votes = await pool.fetchval("SELECT upvotes FROM thread_replies WHERE id=$1", reply_id)
+        return {"myVote": False, "upvotes": new_votes}
+    else:
+        await pool.execute("INSERT INTO reply_votes(user_id,reply_id) VALUES($1,$2)", int(uid), reply_id)
+        await pool.execute("UPDATE thread_replies SET upvotes=upvotes+1 WHERE id=$1", reply_id)
+        new_votes = await pool.fetchval("SELECT upvotes FROM thread_replies WHERE id=$1", reply_id)
+        return {"myVote": True, "upvotes": new_votes}
