@@ -4,14 +4,20 @@ import re
 import json
 import base64
 import tempfile
-from datetime import datetime
+import secrets
+import random
+from datetime import datetime, timedelta, timezone
 
 import yt_dlp
 import openai
 import requests
-from fastapi import FastAPI, HTTPException, Request
+import asyncpg
+import bcrypt
+import jwt
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -23,6 +29,66 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pgadri/my-captures")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_DAYS = 30
+
+# ─── DB pool ─────────────────────────────────────────────────────────────────
+
+_pool: asyncpg.Pool | None = None
+
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            ssl="require",
+            min_size=1,
+            max_size=5,
+        )
+    return _pool
+
+# ─── JWT helpers ─────────────────────────────────────────────────────────────
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+def create_token(user_id: str) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRY_DAYS)
+    return jwt.encode({"sub": user_id, "exp": exp}, SESSION_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_token(token: str) -> str | None:
+    try:
+        payload = jwt.decode(token, SESSION_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload.get("sub")
+    except jwt.PyJWTError:
+        return None
+
+async def current_user_id(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> str:
+    if not creds:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    uid = decode_token(creds.credentials)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return uid
+
+# ─── Auth models ─────────────────────────────────────────────────────────────
+
+class SignupRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class SigninRequest(BaseModel):
+    email: str
+    password: str
+
+class OTPVerifyRequest(BaseModel):
+    email: str
+    code: str
 
 
 def get_groq_client():
@@ -524,3 +590,51 @@ async def chat(request: Request, req: ChatRequest):
         "answer": response.choices[0].message.content,
         "sources": req.captures[:8],
     }
+
+
+# ─── Auth routes ─────────────────────────────────────────────────────────────
+
+@app.post("/auth/signup")
+@limiter.limit("5/minute")
+async def signup(req: SignupRequest, request: Request):
+    if len(req.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    pool = await get_pool()
+    existing = await pool.fetchrow("SELECT id FROM users WHERE email = $1", req.email.lower())
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    pw_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+    user = await pool.fetchrow(
+        "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email",
+        req.name.strip(), req.email.lower().strip(), pw_hash,
+    )
+    token = create_token(str(user["id"]))
+    return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
+
+
+@app.post("/auth/signin")
+@limiter.limit("10/minute")
+async def signin(req: SigninRequest, request: Request):
+    pool = await get_pool()
+    user = await pool.fetchrow(
+        "SELECT id, name, email, password_hash FROM users WHERE email = $1",
+        req.email.lower().strip(),
+    )
+    if not user or not user["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not bcrypt.checkpw(req.password.encode(), user["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_token(str(user["id"]))
+    return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
+
+
+@app.get("/auth/me")
+async def me(uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    user = await pool.fetchrow("SELECT id, name, email, github_username, avatar_url FROM users WHERE id = $1", uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"id": str(user["id"]), "name": user["name"], "email": user["email"],
+            "githubUsername": user["github_username"], "avatarUrl": user["avatar_url"]}

@@ -5,3 +5,7 @@ yt-dlp
 requests
 python-multipart
 slowapi
+asyncpg
+bcrypt
+pyjwt
+python-dotenv
