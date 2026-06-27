@@ -35,7 +35,7 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
-FROM_EMAIL = os.environ.get("FROM_EMAIL", "onboarding@resend.dev")
+FROM_EMAIL = os.environ.get("RESEND_FROM", os.environ.get("FROM_EMAIL", "onboarding@resend.dev"))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 30
 OTP_TTL = 600       # 10 minutes
@@ -160,7 +160,7 @@ def send_otp_email(to_email: str, name: str, code: str, kind: str = "verify"):
     resp = requests.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-        json={"from": f"Vibecoded <{FROM_EMAIL}>", "to": [to_email], "subject": subject, "html": body},
+        json={"from": FROM_EMAIL, "to": [to_email], "subject": subject, "html": body},
         timeout=10,
     )
     if not resp.ok:
