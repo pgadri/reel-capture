@@ -1164,6 +1164,7 @@ async def run_migrations():
             UNIQUE(follower_id, following_id)
         );
         CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
         CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
         CREATE TABLE IF NOT EXISTS threads (
             id SERIAL PRIMARY KEY,
@@ -1523,6 +1524,47 @@ async def update_push_token(req: PushTokenRequest, uid: str = Depends(current_us
     return {"ok": True}
 
 
+@app.delete("/auth/account")
+async def delete_account(uid: str = Depends(current_user_id)):
+    """
+    Anonymise and soft-delete the user account.
+    - Clears PII (name, email, bio, avatar, push_token, external IDs)
+    - Sets email to an unguessable placeholder so the UNIQUE constraint stays valid
+    - Keeps the row so FK-referenced data (threads, packets) doesn't cascade-wipe community content
+    - Marks deleted_at so we can physically purge after a grace period
+    """
+    pool = await get_pool()
+    uid_val = _uid(uid)
+    user = await pool.fetchrow("SELECT id FROM users WHERE id=$1", uid_val)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    import uuid as _uuid
+    ghost_email = f"deleted_{_uuid.uuid4().hex}@vibecoded.invalid"
+    await pool.execute(
+        """UPDATE users SET
+             name         = 'Deleted User',
+             email        = $1,
+             password_hash= NULL,
+             handle       = NULL,
+             bio          = NULL,
+             avatar_url   = NULL,
+             push_token   = NULL,
+             github_id    = NULL,
+             apple_id     = NULL,
+             github_username = NULL,
+             creator_mode = FALSE,
+             youtube_url  = NULL,
+             twitter_url  = NULL,
+             newsletter_url = NULL,
+             website_url  = NULL,
+             deleted_at   = NOW()
+           WHERE id=$2""",
+        ghost_email, uid_val,
+    )
+    return {"ok": True}
+
+
 @app.get("/threads")
 async def list_threads(
     tag: str | None = None,
@@ -1540,10 +1582,14 @@ async def list_threads(
     rows = await pool.fetch(
         f"""SELECT t.id, t.title, t.body, t.tags, t.author_id, t.upvotes,
                    t.reply_count, t.is_resolved, t.created_at, t.updated_at,
-                   u.name AS author_name, u.handle AS author_handle
+                   u.name AS author_name, u.handle AS author_handle,
+                   -- Ranking score: engagement weighted by recency (half-life ~48h)
+                   (t.upvotes * 3 + t.reply_count * 2) /
+                   POWER(1 + EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 86400.0, 1.5)
+                   AS rank_score
             FROM threads t JOIN users u ON u.id = t.author_id
             {where}
-            ORDER BY t.created_at DESC
+            ORDER BY rank_score DESC, t.created_at DESC
             LIMIT ${len(args)+1} OFFSET ${len(args)+2}""",
         *args, limit, offset,
     )
