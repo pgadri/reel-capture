@@ -993,6 +993,129 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
     return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
 
 
+class GithubAuthRequest(BaseModel):
+    code: str
+    redirect_uri: str
+
+class AppleAuthRequest(BaseModel):
+    identity_token: str
+    apple_user_id: str
+    name: str | None = None
+    email: str | None = None
+
+GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+
+
+@app.post("/auth/github")
+@limiter.limit("10/minute")
+async def github_oauth(req: GithubAuthRequest, request: Request):
+    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="GitHub OAuth not configured")
+
+    # Exchange code for access token
+    token_resp = requests.post(
+        "https://github.com/login/oauth/access_token",
+        json={"client_id": GITHUB_CLIENT_ID, "client_secret": GITHUB_CLIENT_SECRET,
+              "code": req.code, "redirect_uri": req.redirect_uri},
+        headers={"Accept": "application/json"},
+        timeout=10,
+    )
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="GitHub OAuth failed — invalid or expired code")
+
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github.v3+json"}
+
+    # Get GitHub user profile
+    gh_user = requests.get("https://api.github.com/user", headers=headers, timeout=10).json()
+    github_id = str(gh_user.get("id", ""))
+    github_name = gh_user.get("name") or gh_user.get("login", "")
+    github_username = gh_user.get("login", "")
+
+    # Get primary email (may be private)
+    email = gh_user.get("email")
+    if not email:
+        emails_resp = requests.get("https://api.github.com/user/emails", headers=headers, timeout=10).json()
+        primary = next((e for e in emails_resp if e.get("primary") and e.get("verified")), None)
+        email = primary["email"] if primary else None
+
+    pool = await get_pool()
+
+    # Find existing user by github_id first, then by email
+    user = await pool.fetchrow("SELECT id, name, email FROM users WHERE github_id=$1", github_id)
+    if not user and email:
+        user = await pool.fetchrow("SELECT id, name, email FROM users WHERE email=$1", email.lower())
+
+    if user:
+        # Link github_id if not yet linked
+        await pool.execute("UPDATE users SET github_id=$1, github_username=$2, email_verified=TRUE WHERE id=$3",
+                           github_id, github_username, user["id"])
+        token = create_token(str(user["id"]))
+        return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
+
+    # New user — create account
+    if not email:
+        raise HTTPException(status_code=400, detail="Could not retrieve a verified email from GitHub. Please make your email public or use email sign-up.")
+
+    handle = await _generate_handle(pool, github_name or github_username)
+    new_user = await pool.fetchrow(
+        """INSERT INTO users (name, email, github_id, github_username, handle, email_verified)
+           VALUES ($1, $2, $3, $4, $5, TRUE)
+           RETURNING id, name, email""",
+        github_name, email.lower(), github_id, github_username, handle,
+    )
+    token = create_token(str(new_user["id"]))
+    return {"token": token, "user": {"id": str(new_user["id"]), "name": new_user["name"], "email": new_user["email"]}, "isNew": True}
+
+
+@app.post("/auth/apple")
+@limiter.limit("10/minute")
+async def apple_oauth(req: AppleAuthRequest, request: Request):
+    claims = _decode_jwt_payload(req.identity_token)
+    apple_sub = claims.get("sub") or req.apple_user_id
+    if not apple_sub:
+        raise HTTPException(status_code=400, detail="Invalid Apple identity token")
+
+    pool = await get_pool()
+
+    # Find by apple_id first, then email
+    user = await pool.fetchrow("SELECT id, name, email FROM users WHERE apple_id=$1", apple_sub)
+    email = req.email or claims.get("email")
+    if not user and email:
+        user = await pool.fetchrow("SELECT id, name, email FROM users WHERE email=$1", email.lower())
+
+    if user:
+        await pool.execute("UPDATE users SET apple_id=$1, email_verified=TRUE WHERE id=$2", apple_sub, user["id"])
+        token = create_token(str(user["id"]))
+        return {"token": token, "user": {"id": str(user["id"]), "name": user["name"], "email": user["email"]}}
+
+    # New user
+    name = req.name or (email.split("@")[0] if email else "Apple User")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required for first-time Apple sign-in. Please allow email access.")
+
+    handle = await _generate_handle(pool, name)
+    new_user = await pool.fetchrow(
+        """INSERT INTO users (name, email, apple_id, handle, email_verified)
+           VALUES ($1, $2, $3, $4, TRUE)
+           RETURNING id, name, email""",
+        name, email.lower(), apple_sub, handle,
+    )
+    token = create_token(str(new_user["id"]))
+    return {"token": token, "user": {"id": str(new_user["id"]), "name": new_user["name"], "email": new_user["email"]}, "isNew": True}
+
+
 @app.get("/auth/me")
 async def me(uid: str = Depends(current_user_id)):
     pool = await get_pool()
@@ -1069,6 +1192,8 @@ async def run_migrations():
         CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_replies_thread ON thread_replies(thread_id, created_at);
         ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation_points INTEGER DEFAULT 0;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS github_id VARCHAR(50) UNIQUE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_id VARCHAR(200) UNIQUE;
         CREATE TABLE IF NOT EXISTS creator_applications (
             id SERIAL PRIMARY KEY,
             user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
