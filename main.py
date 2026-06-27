@@ -18,6 +18,7 @@ import jwt
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -27,6 +28,15 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["200/hour"])
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+_cors_origins = os.environ.get("CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pgadri/my-captures")
@@ -426,6 +436,7 @@ def push_to_github(filename: str, content: str) -> str:
 
 
 @app.get("/health")
+@app.get("/api/healthz")
 def health():
     return {"status": "ok"}
 
@@ -1174,158 +1185,195 @@ async def me(uid: str = Depends(current_user_id)):
 
 @app.on_event("startup")
 async def run_migrations():
+    import logging
     pool = await get_pool()
-    await pool.execute("""
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS handle VARCHAR(50) UNIQUE;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS creator_mode BOOLEAN DEFAULT FALSE;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS youtube_url TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS twitter_url TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS newsletter_url TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS website_url TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS creator_enabled_at TIMESTAMP;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS follower_count INTEGER DEFAULT 0;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS following_count INTEGER DEFAULT 0;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token TEXT;
-        CREATE TABLE IF NOT EXISTS follows (
-            id SERIAL PRIMARY KEY,
-            follower_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            following_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            created_at TIMESTAMP DEFAULT NOW(),
-            UNIQUE(follower_id, following_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
-        CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
-        CREATE TABLE IF NOT EXISTS threads (
-            id SERIAL PRIMARY KEY,
-            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL,
-            tags TEXT[] DEFAULT '{}',
-            upvotes INTEGER DEFAULT 0,
-            reply_count INTEGER DEFAULT 0,
-            is_resolved BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS thread_replies (
-            id SERIAL PRIMARY KEY,
-            thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            body TEXT NOT NULL,
-            upvotes INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS thread_votes (
-            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-            vote INTEGER NOT NULL,
-            PRIMARY KEY(user_id, thread_id)
-        );
-        CREATE TABLE IF NOT EXISTS reply_votes (
-            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            reply_id INTEGER NOT NULL REFERENCES thread_replies(id) ON DELETE CASCADE,
-            PRIMARY KEY(user_id, reply_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_replies_thread ON thread_replies(thread_id, created_at);
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation_points INTEGER DEFAULT 0;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS github_id VARCHAR(50) UNIQUE;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_id VARCHAR(200) UNIQUE;
-        CREATE TABLE IF NOT EXISTS creator_applications (
-            id SERIAL PRIMARY KEY,
-            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            status TEXT DEFAULT 'pending',
-            motivation TEXT NOT NULL,
-            sample_content TEXT NOT NULL,
-            rejection_reason TEXT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            reviewed_at TIMESTAMP,
-            UNIQUE(user_id)
-        );
-        CREATE TABLE IF NOT EXISTS packets (
-            id SERIAL PRIMARY KEY,
-            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            category TEXT DEFAULT 'founder',
-            cover_emoji TEXT DEFAULT '📦',
-            status TEXT DEFAULT 'draft',
-            rejection_reason TEXT,
-            total_reads INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS packet_chapters (
-            id SERIAL PRIMARY KEY,
-            packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            chapter_order INTEGER DEFAULT 0,
-            is_preview BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS packet_reads (
-            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
-            read_at TIMESTAMP DEFAULT NOW(),
-            PRIMARY KEY(user_id, packet_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_packets_status ON packets(status, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_chapters_packet ON packet_chapters(packet_id, chapter_order);
-        CREATE TABLE IF NOT EXISTS products (
-            id SERIAL PRIMARY KEY,
-            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            author_name TEXT NOT NULL,
-            name TEXT NOT NULL,
-            tagline TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            url TEXT,
-            category TEXT NOT NULL,
-            stage TEXT DEFAULT 'beta',
-            logo_emoji TEXT DEFAULT '🚀',
-            tags TEXT[] DEFAULT '{}',
-            looking_for TEXT[] DEFAULT '{}',
-            upvotes INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS product_upvotes (
-            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-            PRIMARY KEY(user_id, product_id)
-        );
-        CREATE TABLE IF NOT EXISTS product_reviews (
-            id SERIAL PRIMARY KEY,
-            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-            author_id UUID REFERENCES users(id) ON DELETE SET NULL,
-            author_name TEXT NOT NULL,
-            type TEXT NOT NULL DEFAULT 'feedback',
-            rating INTEGER,
-            body TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS public_captures (
-            id SERIAL PRIMARY KEY,
-            client_id TEXT NOT NULL,
-            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            author_name TEXT NOT NULL,
-            author_handle TEXT,
-            title TEXT NOT NULL,
-            preview TEXT NOT NULL,
-            category TEXT,
-            source_type TEXT DEFAULT 'video',
-            platform TEXT,
-            creator TEXT,
-            source_url TEXT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            UNIQUE(author_id, client_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_products_created ON products(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_product_reviews_product ON product_reviews(product_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_public_captures_created ON public_captures(created_at DESC);
-    """)
+
+    # Core migrations — all idempotent; safe to run every boot
+    try:
+        await pool.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS handle VARCHAR(50) UNIQUE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS creator_mode BOOLEAN DEFAULT FALSE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS youtube_url TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS twitter_url TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS newsletter_url TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS website_url TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS creator_enabled_at TIMESTAMP;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS follower_count INTEGER DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS following_count INTEGER DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token TEXT;
+            CREATE TABLE IF NOT EXISTS follows (
+                id SERIAL PRIMARY KEY,
+                follower_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                following_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(follower_id, following_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+            CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
+            CREATE TABLE IF NOT EXISTS threads (
+                id SERIAL PRIMARY KEY,
+                author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                tags TEXT[] DEFAULT '{}',
+                upvotes INTEGER DEFAULT 0,
+                reply_count INTEGER DEFAULT 0,
+                is_resolved BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS thread_replies (
+                id SERIAL PRIMARY KEY,
+                thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                body TEXT NOT NULL,
+                upvotes INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS thread_votes (
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                vote INTEGER NOT NULL,
+                PRIMARY KEY(user_id, thread_id)
+            );
+            CREATE TABLE IF NOT EXISTS reply_votes (
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reply_id INTEGER NOT NULL REFERENCES thread_replies(id) ON DELETE CASCADE,
+                PRIMARY KEY(user_id, reply_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_replies_thread ON thread_replies(thread_id, created_at);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation_points INTEGER DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS github_id VARCHAR(50) UNIQUE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_id VARCHAR(200) UNIQUE;
+            CREATE TABLE IF NOT EXISTS creator_applications (
+                id SERIAL PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT DEFAULT 'pending',
+                motivation TEXT NOT NULL,
+                sample_content TEXT NOT NULL,
+                rejection_reason TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                reviewed_at TIMESTAMP,
+                UNIQUE(user_id)
+            );
+            CREATE TABLE IF NOT EXISTS packets (
+                id SERIAL PRIMARY KEY,
+                author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT 'founder',
+                cover_emoji TEXT DEFAULT '📦',
+                status TEXT DEFAULT 'draft',
+                rejection_reason TEXT,
+                total_reads INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS packet_chapters (
+                id SERIAL PRIMARY KEY,
+                packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                chapter_order INTEGER DEFAULT 0,
+                is_preview BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS packet_reads (
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
+                read_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY(user_id, packet_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_packets_status ON packets(status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_chapters_packet ON packet_chapters(packet_id, chapter_order);
+        """)
+    except Exception as e:
+        logging.warning(f"Core migration warning: {e}")
+
+    # Products / launches — separate block so a failure here never kills the server.
+    # products.id may be UUID (pre-existing table) or SERIAL depending on DB state.
+    # We normalise to UUID to match whatever already exists.
+    try:
+        await pool.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                author_name TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL,
+                tagline TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                url TEXT,
+                category TEXT NOT NULL,
+                stage TEXT DEFAULT 'beta',
+                logo_emoji TEXT DEFAULT '🚀',
+                tags TEXT[] DEFAULT '{}',
+                looking_for TEXT[] DEFAULT '{}',
+                upvotes INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+    except Exception as e:
+        logging.warning(f"products table migration: {e}")
+
+    # Ensure products.id always has a UUID default (handles pre-existing table)
+    try:
+        await pool.execute(
+            "ALTER TABLE products ALTER COLUMN id SET DEFAULT gen_random_uuid();"
+        )
+    except Exception as e:
+        logging.warning(f"products default migration: {e}")
+
+    # Ensure author_name column exists on pre-existing products table
+    try:
+        await pool.execute(
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS author_name TEXT NOT NULL DEFAULT '';"
+        )
+    except Exception as e:
+        logging.warning(f"products author_name migration: {e}")
+
+    try:
+        await pool.execute("""
+            CREATE TABLE IF NOT EXISTS product_upvotes (
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                PRIMARY KEY(user_id, product_id)
+            );
+            CREATE TABLE IF NOT EXISTS product_reviews (
+                id SERIAL PRIMARY KEY,
+                product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                author_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                author_name TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'feedback',
+                rating INTEGER,
+                body TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS public_captures (
+                id SERIAL PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                author_name TEXT NOT NULL,
+                author_handle TEXT,
+                title TEXT NOT NULL,
+                preview TEXT NOT NULL,
+                category TEXT,
+                source_type TEXT DEFAULT 'video',
+                platform TEXT,
+                creator TEXT,
+                source_url TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(author_id, client_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_products_created ON products(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_product_reviews_product ON product_reviews(product_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_public_captures_created ON public_captures(created_at DESC);
+        """)
+    except Exception as e:
+        logging.warning(f"Product support tables migration: {e}")
 
 
 def _user_dict(user) -> dict:
@@ -2371,43 +2419,45 @@ async def create_product(req: CreateProductRequest, uid: str = Depends(current_u
 
 
 @app.post("/products/{product_id}/upvote")
-async def toggle_product_upvote(product_id: int, uid: str = Depends(current_user_id)):
+async def toggle_product_upvote(product_id: str, uid: str = Depends(current_user_id)):
     pool = await get_pool()
+    pid = _uuid.UUID(product_id)
     existing = await pool.fetchval(
         "SELECT 1 FROM product_upvotes WHERE user_id=$1 AND product_id=$2",
-        _uid(uid), product_id,
+        _uid(uid), pid,
     )
     if existing:
         await pool.execute(
             "DELETE FROM product_upvotes WHERE user_id=$1 AND product_id=$2",
-            _uid(uid), product_id,
+            _uid(uid), pid,
         )
         await pool.execute(
-            "UPDATE products SET upvotes=GREATEST(0,upvotes-1) WHERE id=$1", product_id,
+            "UPDATE products SET upvotes=GREATEST(0,upvotes-1) WHERE id=$1", pid,
         )
-        new_upvotes = await pool.fetchval("SELECT upvotes FROM products WHERE id=$1", product_id)
+        new_upvotes = await pool.fetchval("SELECT upvotes FROM products WHERE id=$1", pid)
         return {"myUpvote": False, "upvotes": new_upvotes}
     else:
         try:
             await pool.execute(
                 "INSERT INTO product_upvotes (user_id, product_id) VALUES ($1,$2)",
-                _uid(uid), product_id,
+                _uid(uid), pid,
             )
         except asyncpg.UniqueViolationError:
             pass
         await pool.execute(
-            "UPDATE products SET upvotes=upvotes+1 WHERE id=$1", product_id,
+            "UPDATE products SET upvotes=upvotes+1 WHERE id=$1", pid,
         )
-        new_upvotes = await pool.fetchval("SELECT upvotes FROM products WHERE id=$1", product_id)
+        new_upvotes = await pool.fetchval("SELECT upvotes FROM products WHERE id=$1", pid)
         return {"myUpvote": True, "upvotes": new_upvotes}
 
 
 @app.get("/products/{product_id}/reviews")
-async def get_product_reviews(product_id: int):
+async def get_product_reviews(product_id: str):
     pool = await get_pool()
+    pid = _uuid.UUID(product_id)
     rows = await pool.fetch(
         "SELECT * FROM product_reviews WHERE product_id=$1 ORDER BY created_at DESC",
-        product_id,
+        pid,
     )
     return [{
         "id": str(r["id"]),
@@ -2423,19 +2473,20 @@ async def get_product_reviews(product_id: int):
 
 @app.post("/products/{product_id}/reviews")
 async def add_product_review(
-    product_id: int,
+    product_id: str,
     req: AddProductReviewRequest,
     uid: str | None = Depends(optional_user_id),
 ):
     pool = await get_pool()
-    product = await pool.fetchval("SELECT id FROM products WHERE id=$1", product_id)
+    pid = _uuid.UUID(product_id)
+    product = await pool.fetchval("SELECT id FROM products WHERE id=$1", pid)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     author_id = _uid(uid) if uid else None
     row = await pool.fetchrow(
         """INSERT INTO product_reviews (product_id, author_id, author_name, type, rating, body)
            VALUES ($1,$2,$3,$4,$5,$6) RETURNING *""",
-        product_id, author_id, req.authorName, req.type, req.rating, req.body,
+        pid, author_id, req.authorName, req.type, req.rating, req.body,
     )
     return {
         "id": str(row["id"]),
@@ -2503,3 +2554,74 @@ async def unsync_public_capture(client_id: str, uid: str = Depends(current_user_
         _uid(uid), client_id,
     )
     return {"deleted": True}
+
+
+# ─── Repo Info (authenticated GitHub proxy) ──────────────────────────────────
+
+@app.get("/repo-info")
+async def get_repo_info(repo_url: str):
+    """Proxy GitHub API calls through the backend so GITHUB_TOKEN is used (5000 req/hr vs 60)."""
+    try:
+        owner, repo = _parse_owner_repo(repo_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    gh_token = os.environ.get("GITHUB_TOKEN")
+
+    info = _gh(f"/repos/{owner}/{repo}", gh_token)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Repo not found or private")
+
+    branch = info.get("default_branch", "main")
+
+    # Fetch package.json for stack/dependency detection
+    deps: list[str] = []
+    pkg = _gh(f"/repos/{owner}/{repo}/contents/package.json?ref={branch}", gh_token)
+    if pkg and isinstance(pkg, dict) and pkg.get("content"):
+        try:
+            pkg_data = json.loads(base64.b64decode(pkg["content"].replace("\n", "")).decode())
+            deps = list({**pkg_data.get("dependencies", {}), **pkg_data.get("devDependencies", {})}.keys())
+        except Exception:
+            pass
+
+    # Best-effort requirements.txt for Python stacks
+    reqs = _gh(f"/repos/{owner}/{repo}/contents/requirements.txt?ref={branch}", gh_token)
+    if reqs and isinstance(reqs, dict) and reqs.get("content"):
+        try:
+            txt = base64.b64decode(reqs["content"].replace("\n", "")).decode()
+            deps += [l.split("==")[0].split(">=")[0].strip() for l in txt.splitlines() if l.strip()]
+        except Exception:
+            pass
+
+    # Stack detection
+    stack: list[str] = []
+    dl = [d.lower() for d in deps]
+    if "expo" in dl:                                 stack.append("expo")
+    if "react-native" in dl:                         stack.append("react-native")
+    if any(d.startswith("next") for d in dl):        stack.append("nextjs")
+    if any(d in dl for d in ["stripe", "@stripe/stripe-js"]): stack.append("stripe")
+    if "@supabase/supabase-js" in dl:                stack.append("supabase")
+    if any(d in dl for d in ["firebase", "@firebase/app"]): stack.append("firebase")
+    if any(d in dl for d in ["openai", "@anthropic-ai/sdk"]): stack.append("openai")
+    if any(d in dl for d in ["fastapi", "flask", "django"]): stack.append("fastapi")
+
+    payment_kw = ["stripe", "braintree", "paypal", "revenuecat"]
+    auth_kw    = ["supabase", "firebase", "jwt", "passport", "clerk", "auth0", "lucia"]
+    handles_payments = any(any(k in d for k in payment_kw) for d in dl)
+    stores_user_data = any(any(k in d for k in auth_kw) for d in dl)
+
+    return {
+        "name": info.get("name"),
+        "description": info.get("description"),
+        "stargazersCount": info.get("stargazers_count", 0),
+        "forksCount": info.get("forks_count", 0),
+        "openIssuesCount": info.get("open_issues_count", 0),
+        "pushedAt": info.get("pushed_at"),
+        "language": info.get("language"),
+        "visibility": info.get("visibility", "public"),
+        "defaultBranch": branch,
+        "size": info.get("size", 0),
+        "detectedStack": stack,
+        "storesUserData": stores_user_data,
+        "handlesPayments": handles_payments,
+    }
