@@ -248,6 +248,37 @@ class AdminReviewRequest(BaseModel):
     reason: str | None = None
 
 
+class CreateProductRequest(BaseModel):
+    name: str
+    tagline: str
+    description: str = ""
+    url: str | None = None
+    category: str
+    stage: str = "beta"
+    logoEmoji: str = "🚀"
+    tags: list[str] = []
+    lookingFor: list[str] = []
+
+
+class AddProductReviewRequest(BaseModel):
+    type: str
+    rating: int | None = None
+    body: str
+    authorName: str
+
+
+class SyncCaptureRequest(BaseModel):
+    clientId: str
+    title: str
+    preview: str
+    category: str | None = None
+    sourceType: str = "video"
+    platform: str | None = None
+    creator: str | None = None
+    sourceUrl: str | None = None
+    authorName: str
+
+
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
 
 
@@ -1244,6 +1275,56 @@ async def run_migrations():
         );
         CREATE INDEX IF NOT EXISTS idx_packets_status ON packets(status, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_chapters_packet ON packet_chapters(packet_id, chapter_order);
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            author_name TEXT NOT NULL,
+            name TEXT NOT NULL,
+            tagline TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            url TEXT,
+            category TEXT NOT NULL,
+            stage TEXT DEFAULT 'beta',
+            logo_emoji TEXT DEFAULT '🚀',
+            tags TEXT[] DEFAULT '{}',
+            looking_for TEXT[] DEFAULT '{}',
+            upvotes INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS product_upvotes (
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+            PRIMARY KEY(user_id, product_id)
+        );
+        CREATE TABLE IF NOT EXISTS product_reviews (
+            id SERIAL PRIMARY KEY,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+            author_id UUID REFERENCES users(id) ON DELETE SET NULL,
+            author_name TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'feedback',
+            rating INTEGER,
+            body TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS public_captures (
+            id SERIAL PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            author_name TEXT NOT NULL,
+            author_handle TEXT,
+            title TEXT NOT NULL,
+            preview TEXT NOT NULL,
+            category TEXT,
+            source_type TEXT DEFAULT 'video',
+            platform TEXT,
+            creator TEXT,
+            source_url TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(author_id, client_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_products_created ON products(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_product_reviews_product ON product_reviews(product_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_public_captures_created ON public_captures(created_at DESC);
     """)
 
 
@@ -2226,3 +2307,199 @@ async def admin_list_packets(request: Request, status: str = "pending_review"):
         status,
     )
     return [_packet_row(r) for r in rows]
+
+
+# ─── Products / Launches ──────────────────────────────────────────────────────
+
+def _product_row(row, my_upvote: bool = False) -> dict:
+    return {
+        "id": str(row["id"]),
+        "authorId": str(row["author_id"]),
+        "authorName": row["author_name"],
+        "name": row["name"],
+        "tagline": row["tagline"],
+        "description": row["description"] or "",
+        "url": row["url"],
+        "category": row["category"],
+        "stage": row["stage"],
+        "logoEmoji": row["logo_emoji"],
+        "tags": list(row["tags"] or []),
+        "lookingFor": list(row["looking_for"] or []),
+        "upvotes": row["upvotes"],
+        "myUpvote": my_upvote,
+        "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
+@app.get("/products")
+async def list_products(
+    offset: int = 0,
+    limit: int = 30,
+    viewer_id: str | None = Depends(optional_user_id),
+):
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM products ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        limit, offset,
+    )
+    if not rows:
+        return []
+    if viewer_id:
+        product_ids = [r["id"] for r in rows]
+        voted = await pool.fetch(
+            "SELECT product_id FROM product_upvotes WHERE user_id=$1 AND product_id=ANY($2)",
+            _uid(viewer_id), product_ids,
+        )
+        voted_ids = {r["product_id"] for r in voted}
+        return [_product_row(r, my_upvote=r["id"] in voted_ids) for r in rows]
+    return [_product_row(r) for r in rows]
+
+
+@app.post("/products")
+async def create_product(req: CreateProductRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    user = await pool.fetchrow("SELECT name FROM users WHERE id=$1", _uid(uid))
+    row = await pool.fetchrow(
+        """INSERT INTO products
+               (author_id, author_name, name, tagline, description, url,
+                category, stage, logo_emoji, tags, looking_for)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *""",
+        _uid(uid), user["name"], req.name, req.tagline, req.description, req.url,
+        req.category, req.stage, req.logoEmoji, req.tags, req.lookingFor,
+    )
+    return _product_row(row)
+
+
+@app.post("/products/{product_id}/upvote")
+async def toggle_product_upvote(product_id: int, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    existing = await pool.fetchval(
+        "SELECT 1 FROM product_upvotes WHERE user_id=$1 AND product_id=$2",
+        _uid(uid), product_id,
+    )
+    if existing:
+        await pool.execute(
+            "DELETE FROM product_upvotes WHERE user_id=$1 AND product_id=$2",
+            _uid(uid), product_id,
+        )
+        await pool.execute(
+            "UPDATE products SET upvotes=GREATEST(0,upvotes-1) WHERE id=$1", product_id,
+        )
+        new_upvotes = await pool.fetchval("SELECT upvotes FROM products WHERE id=$1", product_id)
+        return {"myUpvote": False, "upvotes": new_upvotes}
+    else:
+        try:
+            await pool.execute(
+                "INSERT INTO product_upvotes (user_id, product_id) VALUES ($1,$2)",
+                _uid(uid), product_id,
+            )
+        except asyncpg.UniqueViolationError:
+            pass
+        await pool.execute(
+            "UPDATE products SET upvotes=upvotes+1 WHERE id=$1", product_id,
+        )
+        new_upvotes = await pool.fetchval("SELECT upvotes FROM products WHERE id=$1", product_id)
+        return {"myUpvote": True, "upvotes": new_upvotes}
+
+
+@app.get("/products/{product_id}/reviews")
+async def get_product_reviews(product_id: int):
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM product_reviews WHERE product_id=$1 ORDER BY created_at DESC",
+        product_id,
+    )
+    return [{
+        "id": str(r["id"]),
+        "productId": str(r["product_id"]),
+        "authorId": str(r["author_id"]) if r["author_id"] else None,
+        "authorName": r["author_name"],
+        "type": r["type"],
+        "rating": r["rating"],
+        "body": r["body"],
+        "createdAt": r["created_at"].isoformat() if r["created_at"] else None,
+    } for r in rows]
+
+
+@app.post("/products/{product_id}/reviews")
+async def add_product_review(
+    product_id: int,
+    req: AddProductReviewRequest,
+    uid: str | None = Depends(optional_user_id),
+):
+    pool = await get_pool()
+    product = await pool.fetchval("SELECT id FROM products WHERE id=$1", product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    author_id = _uid(uid) if uid else None
+    row = await pool.fetchrow(
+        """INSERT INTO product_reviews (product_id, author_id, author_name, type, rating, body)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING *""",
+        product_id, author_id, req.authorName, req.type, req.rating, req.body,
+    )
+    return {
+        "id": str(row["id"]),
+        "productId": str(row["product_id"]),
+        "authorId": str(row["author_id"]) if row["author_id"] else None,
+        "authorName": row["author_name"],
+        "type": row["type"],
+        "rating": row["rating"],
+        "body": row["body"],
+        "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
+# ─── Public Captures ──────────────────────────────────────────────────────────
+
+@app.get("/public-captures")
+async def list_public_captures(offset: int = 0, limit: int = 30):
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM public_captures ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        limit, offset,
+    )
+    return [{
+        "id": str(r["id"]),
+        "clientId": r["client_id"],
+        "authorId": str(r["author_id"]),
+        "authorName": r["author_name"],
+        "authorHandle": r["author_handle"],
+        "title": r["title"],
+        "preview": r["preview"],
+        "category": r["category"],
+        "sourceType": r["source_type"],
+        "platform": r["platform"],
+        "creator": r["creator"],
+        "sourceUrl": r["source_url"],
+        "createdAt": r["created_at"].isoformat() if r["created_at"] else None,
+    } for r in rows]
+
+
+@app.post("/public-captures")
+async def sync_public_capture(req: SyncCaptureRequest, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    user = await pool.fetchrow("SELECT name, handle FROM users WHERE id=$1", _uid(uid))
+    row = await pool.fetchrow(
+        """INSERT INTO public_captures
+               (client_id, author_id, author_name, author_handle, title, preview,
+                category, source_type, platform, creator, source_url)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (author_id, client_id) DO UPDATE
+               SET title=$5, preview=$6, category=$7, source_type=$8,
+                   platform=$9, creator=$10, source_url=$11
+           RETURNING *""",
+        req.clientId, _uid(uid), user["name"], user["handle"],
+        req.title, req.preview, req.category, req.sourceType,
+        req.platform, req.creator, req.sourceUrl,
+    )
+    return {"id": str(row["id"]), "clientId": row["client_id"]}
+
+
+@app.delete("/public-captures/{client_id}")
+async def unsync_public_capture(client_id: str, uid: str = Depends(current_user_id)):
+    pool = await get_pool()
+    await pool.execute(
+        "DELETE FROM public_captures WHERE author_id=$1 AND client_id=$2",
+        _uid(uid), client_id,
+    )
+    return {"deleted": True}
