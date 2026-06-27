@@ -1130,6 +1130,12 @@ async def me(uid: str = Depends(current_user_id)):
     )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # Backfill handle for accounts created before handle generation was added
+    if not user["handle"]:
+        handle = await _generate_handle(pool, user["name"])
+        await pool.execute("UPDATE users SET handle=$1 WHERE id=$2", handle, uid)
+        user = dict(user)
+        user["handle"] = handle
     return _user_dict(user)
 
 
