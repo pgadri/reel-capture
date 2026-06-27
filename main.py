@@ -157,12 +157,14 @@ def send_otp_email(to_email: str, name: str, code: str, kind: str = "verify"):
           <p style="color:#888">Valid for 10 minutes. If you didn't request this, ignore this email.</p>
         </div>"""
 
-    requests.post(
+    resp = requests.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
         json={"from": f"Vibecoded <{FROM_EMAIL}>", "to": [to_email], "subject": subject, "html": body},
         timeout=10,
     )
+    if not resp.ok:
+        print(f"[EMAIL ERROR] Resend {resp.status_code}: {resp.text}")
 
 
 def get_groq_client():
