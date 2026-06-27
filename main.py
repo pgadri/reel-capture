@@ -818,6 +818,27 @@ async def chat(request: Request, req: ChatRequest):
 
 # ─── Auth routes ─────────────────────────────────────────────────────────────
 
+async def _generate_handle(pool, name: str) -> str:
+    import re
+    parts = name.strip().split()
+    if len(parts) >= 2:
+        base = (parts[0][0] + parts[-1]).lower()
+    else:
+        base = parts[0].lower()
+    base = re.sub(r"[^a-z0-9]", "", base)
+    if not base:
+        base = "user"
+    # find first available: base, base1, base2, ...
+    candidate = base
+    n = 1
+    while True:
+        taken = await pool.fetchval("SELECT id FROM users WHERE handle=$1", candidate)
+        if not taken:
+            return candidate
+        candidate = f"{base}{n}"
+        n += 1
+
+
 @app.post("/auth/signup")
 @limiter.limit("5/minute")
 async def signup(req: SignupRequest, request: Request):
@@ -831,13 +852,17 @@ async def signup(req: SignupRequest, request: Request):
     pw_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
     email = req.email.lower().strip()
     name = req.name.strip()
+    handle = await _generate_handle(pool, name)
 
     if existing:
-        await pool.execute("UPDATE users SET name=$1, password_hash=$2 WHERE email=$3", name, pw_hash, email)
+        await pool.execute(
+            "UPDATE users SET name=$1, password_hash=$2 WHERE email=$3",
+            name, pw_hash, email,
+        )
     else:
         await pool.execute(
-            "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3)",
-            name, email, pw_hash,
+            "INSERT INTO users (name, email, password_hash, handle) VALUES ($1, $2, $3, $4)",
+            name, email, pw_hash, handle,
         )
 
     code = generate_otp()
